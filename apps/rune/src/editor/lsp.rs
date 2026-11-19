@@ -1846,7 +1846,8 @@ pub fn take_fallback(ed: &mut EditorState) -> Option<GoToRequest> {
 /// key and handles below/flip/clamp itself.
 pub fn hover_layer(s: &crate::State, cx: &rune::Cx<crate::State>, k: &Kit) -> Option<El> {
     let text = s.editor.lsp_hover_text()?;
-    let caret = cx.caret(crate::editor::code::FIELD_KEY)?;
+    let path = s.editor.doc.as_ref().map(|d| d.path.as_str())?;
+    let caret = cx.caret(&crate::editor::code::doc_field_key(path))?;
     let marker = rune::el()
         .absolute(caret[0], caret[1] + caret[3] + 2.0)
         .w(1.0)

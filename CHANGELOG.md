@@ -10,6 +10,21 @@ Rename the `Unreleased` heading to the version and date when tagging a release.
 
 ## [Unreleased]
 
+### Added
+
+- Switching between open file tabs is immediate, even for large files: each
+  open tab keeps its editor alive while the tab is open, so switching reuses the
+  text that was already laid out instead of laying the whole file out again.
+  The first time a file opens it still lays out once, as before.
+- File names in the Files tree take their Git status colour — orange for
+  edited, green for added or untracked, red for deleted or conflicted, blue for
+  renamed — and a folder takes the colour of the most significant change beneath
+  it, so a collapsed folder still shows that it holds changes. Each open file's
+  tab shows a matching colour dot, so the working tree is visible without
+  switching to Changes. The unsaved `•` stays, and a screen reader reads the
+  status with the tab's name. The colours follow the Changes data Goko already
+  refreshes.
+
 ## [0.3.0] - 2026-11-18
 
 ### Added

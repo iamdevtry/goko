@@ -1761,7 +1761,9 @@ impl EditorState {
         // so nothing unsaved leaves. A pending reload targeted the OLD doc —
         // never let it land on the new one.
         self.doc_reload = None;
+        let focused = self.doc.as_ref().is_some_and(|d| d.code.edit.focused);
         self.tabs.open(&mut self.doc, doc);
+        self.carry_focus_to_active(focused);
         self.activate_files();
         // The blame annotations describe the file on disk — ask for them
         // now that the document is open.
@@ -1771,14 +1773,46 @@ impl EditorState {
         crate::editor::line_changes::request(self);
     }
 
+    /// The code state for `path`: the active document or a parked tab.
+    /// `None` for a path that is not open in the editor.
+    pub fn doc_code(&self, path: &str) -> Option<&crate::editor::code::CodeState> {
+        if let Some(doc) = self.doc.as_ref().filter(|d| d.path == path) {
+            return Some(&doc.code);
+        }
+        self.tabs.parked.get(path).map(|doc| &doc.code)
+    }
+
+    /// The mutable code state for `path` — the active document or a parked
+    /// tab.
+    pub fn doc_code_mut(&mut self, path: &str) -> Option<&mut crate::editor::code::CodeState> {
+        if self.doc.as_ref().is_some_and(|d| d.path == path) {
+            return self.doc.as_mut().map(|d| &mut d.code);
+        }
+        self.tabs.parked.get_mut(path).map(|doc| &mut doc.code)
+    }
+
+    /// Move the app's field focus onto the active tab and clear it on every
+    /// parked document: each tab owns its own `TextEdit`, so a switch has to
+    /// hand the field focus over explicitly.
+    fn carry_focus_to_active(&mut self, focused: bool) {
+        for doc in self.tabs.parked.values_mut() {
+            doc.code.edit.focused = false;
+        }
+        if let Some(doc) = self.doc.as_mut() {
+            doc.code.edit.focused = focused;
+        }
+    }
+
     /// Make the parked tab `path` the active document; `true` when the tab
     /// switched. The active-only pipelines re-arm around the swap —
     /// parked tabs receive no highlight, blame, line-change or disk-check
     /// results, so activation re-requests them.
     pub fn activate_tab(&mut self, path: &str) -> bool {
+        let focused = self.doc.as_ref().is_some_and(|d| d.code.edit.focused);
         if !self.tabs.activate(&mut self.doc, path) {
             return false;
         }
+        self.carry_focus_to_active(focused);
         self.after_active_change();
         true
     }
@@ -1786,9 +1820,11 @@ impl EditorState {
     /// Activate the tab `delta` positions away in open order, wrapping —
     /// the next/previous-tab chords. `false` with fewer than two tabs.
     pub fn step_tab(&mut self, delta: i32) -> bool {
+        let focused = self.doc.as_ref().is_some_and(|d| d.code.edit.focused);
         if self.tabs.step(&mut self.doc, delta).is_none() {
             return false;
         }
+        self.carry_focus_to_active(focused);
         self.after_active_change();
         true
     }
@@ -1799,6 +1835,7 @@ impl EditorState {
     /// document, so it re-requests nothing.
     pub fn close_tab(&mut self, path: &str) {
         let was_active = self.doc.as_ref().is_some_and(|d| d.path == path);
+        let focused = self.doc.as_ref().is_some_and(|d| d.code.edit.focused);
         self.tabs.close(&mut self.doc, path);
         if was_active && self.doc.as_ref().is_some_and(|d| d.path == path) {
             // The active doc was never registered as a tab (a direct
@@ -1809,6 +1846,7 @@ impl EditorState {
             }
         }
         if was_active {
+            self.carry_focus_to_active(focused);
             self.after_active_change();
         }
     }
@@ -2302,6 +2340,23 @@ mod tests {
             truncated: false,
             size: text.len() as u64,
         }
+    }
+
+    #[test]
+    fn doc_code_selects_the_active_or_parked_document() {
+        let mut e = editor();
+        select(&mut e);
+        e.install_doc("a.txt".into(), text_file("a\n"), None);
+        let mut b = text_file("b\n");
+        b.path = "b.txt".into();
+        e.install_doc("b.txt".into(), b, None);
+        assert_eq!(e.doc.as_ref().unwrap().path, "b.txt", "b is active");
+        assert_eq!(e.doc_code("b.txt").unwrap().edit.text, "b\n");
+        assert_eq!(e.doc_code("a.txt").unwrap().edit.text, "a\n", "a parked");
+        assert!(e.doc_code("missing.txt").is_none());
+        e.doc_code_mut("a.txt").unwrap().edit.insert("x");
+        assert_eq!(e.tabs.parked.get("a.txt").unwrap().code.edit.text, "xa\n");
+        assert!(e.doc_code_mut("missing.txt").is_none());
     }
 
     fn reply(
