@@ -120,8 +120,13 @@ fn mounted_editables(s: &State) -> Vec<&TextEdit> {
     let mut v: Vec<&TextEdit> = Vec::new();
     match e.section {
         Section::Files => {
-            v.push(&e.files.filter);
-            v.push(&e.files.search_edit);
+            // The aside header mounts one input: the filter on the `Files`
+            // tab, the search box on `Text`/`Context`.
+            if e.files.search.open {
+                v.push(&e.files.search_edit);
+            } else {
+                v.push(&e.files.filter);
+            }
             if let Some(d) = e.doc.as_ref().filter(|d| d.editable()) {
                 v.push(&d.code.edit);
                 if d.code.find.open {
@@ -148,8 +153,13 @@ fn mounted_editables_mut(s: &mut State) -> Vec<&mut TextEdit> {
     let mut v: Vec<&mut TextEdit> = Vec::new();
     match e.section {
         Section::Files => {
-            v.push(&mut e.files.filter);
-            v.push(&mut e.files.search_edit);
+            // Only the input the header has mounted: the filter on `Files`,
+            // the search box on `Text`/`Context`.
+            if e.files.search.open {
+                v.push(&mut e.files.search_edit);
+            } else {
+                v.push(&mut e.files.filter);
+            }
             if let Some(d) = e.doc.as_mut().filter(|d| d.editable()) {
                 v.push(&mut d.code.edit);
                 if d.code.find.open {
@@ -191,6 +201,14 @@ fn focus_text(e: &mut TextEdit) {
     e.focused = true;
     let n = e.text.len();
     e.set_selection(0, n);
+}
+
+/// Focus `e` with the caret at its end: switching the Files tab keeps typing
+/// where the text left off instead of selecting everything.
+pub fn focus_text_end(e: &mut TextEdit) {
+    e.focused = true;
+    let n = e.text.len();
+    e.set_selection(n, n);
 }
 
 /// Plain-key gate shared by digits/j/k/Enter: checkout selected, nothing
@@ -295,15 +313,18 @@ fn find(s: &mut State, _tx: &mut Tx) -> bool {
     true
 }
 
-/// ⇧⌘F: focus the Files search box (always visible) in Text mode with its text
-/// selected — the existing `search_edit`/`Req::Search` path, no new backend
-/// surface. The section switch goes through the same guarded navigation the
-/// tabs use; the results show once the re-armed query is issued.
+/// ⇧⌘F: focus the Files search input in Text mode with its text selected —
+/// the existing `search_edit`/`Req::Search` path, no new backend surface. The
+/// pane's `Text` tab shows at once so the results land in view; the section
+/// switch goes through the same guarded navigation the tabs use.
 fn open_content_search(s: &mut State, tx: &mut Tx) {
     if !ready(s) {
         return;
     }
     crate::editor::search::force_content(&mut s.editor.files.search);
+    // The search pane owns the aside: show its `Text` tab now, before the
+    // re-armed query's debounce fires.
+    s.editor.files.search.open = true;
     clear_edit_focuses(s);
     focus_text(&mut s.editor.files.search_edit);
     if s.editor.section != Section::Files {
@@ -316,7 +337,12 @@ fn open_content_search(s: &mut State, tx: &mut Tx) {
 fn focus_section_filter(s: &mut State) -> bool {
     clear_edit_focuses(s);
     match s.editor.section {
-        Section::Files => focus_text(&mut s.editor.files.filter),
+        Section::Files => {
+            // ⌘F targets the file filter, so the aside returns to its `Files`
+            // tab.
+            s.editor.files.search.open = false;
+            focus_text(&mut s.editor.files.filter)
+        }
         Section::Changes => focus_text(&mut s.editor.changes.filter),
         Section::History => focus_text(&mut s.editor.history.filter),
         Section::Stashes => focus_text(&mut s.editor.stashes.filter),
@@ -1059,35 +1085,70 @@ mod tests {
     }
 
     #[test]
-    fn shift_cmd_f_focuses_the_always_visible_box_without_opening_results() {
+    fn shift_cmd_f_opens_the_pane_in_text_mode() {
+        use crate::editor::state::search_state::SearchMode;
         let mut s = scene();
         s.editor.files.search.open = false;
+        s.editor.files.search.mode = SearchMode::Concept;
+        s.editor.files.search.query = "needle".into();
+        s.editor.files.search.searching = true;
         s.editor.files.search_edit.text = "needle".into();
         let mut tx = Tx::default();
         open_content_search(&mut s, &mut tx);
+        assert_eq!(s.editor.files.search.mode, SearchMode::Content);
         assert!(s.editor.files.search_edit.focused);
         assert!(
             !s.editor.files.filter.focused,
             "the file filter gives up focus"
         );
         assert!(
-            !s.editor.files.search.open,
-            "the results show once the re-armed query is issued"
+            s.editor.files.search.open,
+            "the pane shows at once, before the re-armed query lands"
         );
         assert!(s.editor.files.search.pending.is_some());
+        assert!(
+            !s.editor.files.search.searching,
+            "forcing Content clears the old mode's run"
+        );
     }
 
     #[test]
-    fn the_search_box_is_always_in_the_focus_list_but_rows_only_navigate_while_results_show() {
+    fn cmd_f_returns_to_the_files_tab() {
+        let mut s = scene();
+        s.editor.section = Section::Files;
+        s.editor.files.search.open = true;
+        s.editor.files.search_edit.text = "needle".into();
+        assert!(focus_section_filter(&mut s));
+        assert!(
+            !s.editor.files.search.open,
+            "⌘F targets the file filter, so the Files tab shows"
+        );
+        assert!(s.editor.files.filter.focused);
+        assert!(!s.editor.files.search_edit.focused);
+    }
+
+    #[test]
+    fn only_the_mounted_input_is_in_the_focus_list_and_rows_need_the_pane() {
         let mut s = scene();
         s.editor.section = Section::Files;
         s.editor.files.search.open = false;
-        let edit = &s.editor.files.search_edit as *const TextEdit;
-        assert!(
-            mounted_editables(&s)
+        let filter = &s.editor.files.filter as *const TextEdit;
+        let search = &s.editor.files.search_edit as *const TextEdit;
+        let mounted = |s: &State, field: *const TextEdit| {
+            mounted_editables(s)
                 .iter()
-                .any(|e| std::ptr::eq(*e as *const TextEdit, edit)),
-            "typing in the always-visible box counts as typing"
+                .any(|e| std::ptr::eq(*e as *const TextEdit, field))
+        };
+        assert!(mounted(&s, filter), "the Files tab mounts the filter");
+        assert!(
+            !mounted(&s, search),
+            "the search box is not mounted on the Files tab"
+        );
+        s.editor.files.search.open = true;
+        assert!(mounted(&s, search), "a search tab mounts the search box");
+        assert!(
+            !mounted(&s, filter),
+            "the filter is not mounted on a search tab"
         );
         s.editor.files.search.results = Some(GitViewSearch {
             matches: vec![GitViewSearchMatch {
@@ -1097,6 +1158,7 @@ mod tests {
             }],
             truncated: false,
         });
+        s.editor.files.search.open = false;
         assert!(
             nav_items(&s)
                 .iter()

@@ -10,6 +10,12 @@ Rename the `Unreleased` heading to the version and date when tagging a release.
 
 ## [Unreleased]
 
+### Changed
+
+- The file filter and the code search now share one input under `Files | Text | Context`
+  tabs above the file tree, so the editor keeps its full height and width; the file
+  actions moved into the `File actions` menu.
+
 ## [0.3.0] - 2026-11-18
 
 ### Added

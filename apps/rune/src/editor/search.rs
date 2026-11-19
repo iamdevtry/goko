@@ -411,11 +411,12 @@ pub fn on_query_change(s: &mut State, tx: &mut Tx) {
         s.editor.files.search.pending = None;
         s.editor.files.search.results = None;
         s.editor.files.search.error = None;
-        // A cleared or one-character box has nothing to show: the tree returns.
-        s.editor.files.search.open = false;
-        if s.editor.files.search.mode == SearchMode::Concept {
-            s.editor.files.search.searching = false;
-        }
+        // A cleared or one-character box has nothing to show, but the search
+        // tab owns the aside: it stays on its `Type at least 2 characters`
+        // text. Clearing `query` and `searching` also drops a reply still in
+        // flight for the text the user just shortened.
+        s.editor.files.search.query.clear();
+        s.editor.files.search.searching = false;
         return;
     }
     s.editor.files.search.pending = Some((query, 0.0));
@@ -502,8 +503,8 @@ pub fn poll(state: &mut State, now: f64, tx: &mut Tx) -> bool {
             Some((state.editor.files.search_edit.text.trim().to_string(), 0.0));
         return true;
     }
-    // Issuing a query makes the aside show its results (the filter hides them).
-    state.editor.files.search.open = true;
+    // The tab owns the aside: issuing a query must not pull the pane back
+    // after the user picked `Files` or edited the file filter.
     if state.editor.files.search.mode == SearchMode::Concept {
         let has_pass = state
             .editor
@@ -1048,8 +1049,11 @@ mod tests {
         assert_eq!(s.editor.files.search.index, IndexStatus::Idle);
     }
 
+    /// The pane belongs to the tab, not to the query: a pending query on the
+    /// `Files` tab is issued without showing the pane, and a search tab keeps
+    /// the pane across a query and a short box.
     #[test]
-    fn issuing_a_query_shows_the_results_and_a_short_box_hides_them() {
+    fn a_query_never_shows_the_pane_and_a_short_box_keeps_it() {
         let mut s = state_with_checkout();
         let mut tx = Tx::default();
         assert!(!s.editor.files.search.open);
@@ -1060,17 +1064,71 @@ mod tests {
             "typing alone shows nothing until the debounce fires"
         );
         assert!(poll(&mut s, 1.0, &mut tx));
-        assert!(s.editor.files.search.open);
+        assert!(
+            !s.editor.files.search.open,
+            "the Files tab keeps the tree when the query lands"
+        );
+        // The user picks the search tab.
+        s.editor.files.search.open = true;
         s.editor.files.search_edit.text = "n".into();
         on_query_change(&mut s, &mut tx);
-        assert!(!s.editor.files.search.open);
+        assert!(
+            s.editor.files.search.open,
+            "the search tab keeps the pane when the box shrinks"
+        );
         s.editor.files.search_edit.text = "needle".into();
         on_query_change(&mut s, &mut tx);
         assert!(poll(&mut s, 2.0, &mut tx));
         assert!(s.editor.files.search.open);
         s.editor.files.search_edit.text.clear();
         on_query_change(&mut s, &mut tx);
-        assert!(!s.editor.files.search.open);
+        assert!(
+            s.editor.files.search.open,
+            "a cleared box keeps the pane with its hint"
+        );
+    }
+
+    /// The pane belongs to the tab, not to the result set: a query below
+    /// `MIN_QUERY` clears what the last query left behind and nothing else.
+    #[test]
+    fn short_query_keeps_the_pane_open() {
+        let mut s = state_with_checkout();
+        let mut tx = Tx::default();
+        s.editor.files.search.open = true;
+        s.editor.files.search.results = Some(app_core::git_view::GitViewSearch {
+            matches: Vec::new(),
+            truncated: false,
+        });
+        s.editor.files.search.error = Some("boom".into());
+        s.editor.files.search.pending = Some(("needle".into(), 0.0));
+        s.editor.files.search.query = "needle".into();
+        s.editor.files.search.searching = true;
+        s.editor.files.search_edit.text = "n".into();
+        on_query_change(&mut s, &mut tx);
+        assert!(s.editor.files.search.open, "the tab owns the pane");
+        assert!(s.editor.files.search.results.is_none());
+        assert!(s.editor.files.search.pending.is_none());
+        assert!(s.editor.files.search.error.is_none());
+        assert!(
+            s.editor.files.search.query.is_empty(),
+            "a reply for the abandoned query is dropped"
+        );
+        assert!(!s.editor.files.search.searching);
+    }
+
+    /// The tab owns the pane: a debounced query that lands after the user
+    /// picked `Files` (or edited the filter) is still issued and stored, but
+    /// the aside keeps the tree.
+    #[test]
+    fn an_issued_query_never_pulls_the_aside_back_to_the_results() {
+        let mut s = state_with_checkout();
+        let mut tx = Tx::default();
+        s.editor.files.search.open = false;
+        s.editor.files.search.pending = Some(("needle".into(), 0.0));
+        s.editor.files.search_edit.text = "needle".into();
+        assert!(poll(&mut s, 1.0, &mut tx), "the pending query was issued");
+        assert!(!s.editor.files.search.open, "the Files tab keeps the tree");
+        assert_eq!(s.editor.files.search.query, "needle");
     }
 
     #[test]
@@ -1078,6 +1136,7 @@ mod tests {
         let mut s = state_with_checkout();
         let mut tx = Tx::default();
         s.editor.files.search.mode = SearchMode::Concept;
+        s.editor.files.search.open = true;
         s.editor.files.search_edit.text = "needle".into();
         on_query_change(&mut s, &mut tx);
         assert!(poll(&mut s, 1.0, &mut tx));

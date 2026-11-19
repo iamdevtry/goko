@@ -175,6 +175,8 @@ pub struct FilesState {
     pub menu: Option<FileMenu>,
     /// The code surface's context menu: where the secondary press landed.
     pub code_menu: Option<(f32, f32)>,
+    /// The aside header's `File actions` menu is open at its button.
+    pub actions_open: bool,
 }
 
 /// A tree row's context menu, opened by a secondary press at (`x`, `y`).
@@ -239,10 +241,9 @@ pub mod search_state {
         pub checkout: Option<String>,
         pub searching: bool,
         pub error: Option<String>,
-        /// The Files aside shows the results instead of the tree. Set when a
-        /// query is issued (or the go-to-definition fallback shows its
-        /// results); cleared when the box is cleared or shortened, when the
-        /// file filter is edited, and on a checkout switch.
+        /// The Files aside shows the search pane instead of the tree. Set when a
+        /// search tab is picked (or a search entry point shows the pane);
+        /// cleared when the file filter is edited and on a checkout switch.
         pub open: bool,
         pub mode: SearchMode,
         pub index: IndexStatus,
@@ -655,6 +656,7 @@ impl EditorState {
                 reveal: None,
                 menu: None,
                 code_menu: None,
+                actions_open: false,
             },
             indexer,
             branch: Default::default(),

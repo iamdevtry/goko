@@ -1194,6 +1194,9 @@ fn view(s: &State, cx: &mut Cx<State>) -> El {
     if let Some(menu) = editor::files::code_menu_layer(s, &mut layer) {
         root = root.child(menu);
     }
+    if let Some(menu) = editor::files::actions_menu_layer(s, &mut layer) {
+        root = root.child(menu);
+    }
     if let Some(prompt) = sidebar::input_layer(s, ink, &mut layer) {
         root = root.child(prompt);
     }
@@ -2340,8 +2343,8 @@ mod view_tests {
         );
         assert_no_horizontal_overflow(&rt, 760.0);
         // The editor surface keeps usable width in the remaining space:
-        // its `text_input` mounts below the toolbars (y > 150 at this
-        // viewport) and must be wider than a sliver.
+        // its `text_input` mounts below the Files aside header (y > 150 at
+        // this viewport) and must be wider than a sliver.
         let editor_fields: Vec<_> = els(&rt)
             .into_iter()
             .filter(|el| el.role == "textbox" && el.rect[1] > 150.0)

@@ -9,7 +9,8 @@
 
 use rune::{El, KeyEvent, Tx, col, row};
 use rune_kit::{
-    FileNode, Kit, MenuItem, ScrollBar, Tree, TreeItem, TreeKey, TreeModel, TreeStyle, context_menu,
+    FileNode, Kit, Menu, MenuItem, ScrollBar, Tree, TreeItem, TreeKey, TreeModel, TreeStyle,
+    context_menu,
 };
 
 use crate::State;
@@ -23,16 +24,16 @@ use crate::editor::state::search_state::{IndexStatus, SearchMode};
 use crate::editor::state::{FileMark, FileMenu};
 use crate::theme::{self, Ink, T11M_LH, T12, T12M, T12TN};
 
-/// Files section root: toolbar (file filter + file actions, then the always
-/// visible search row), then [aside: tree or search results | editor] split —
-/// the aside swaps content like the desktop `SplitPane`, the editor flexes to
+/// Files section root: [aside | grip | editor] — the aside carries its own
+/// header (`Files | Text | Context` plus one input) above the file tree or the
+/// search results, so the editor keeps the split's whole height and width.
+/// The aside swaps content like the desktop `SplitPane`, the editor flexes to
 /// the remaining width.
 pub fn files_view(s: &State, ink: &Ink, k: &Kit) -> El {
     let mut root = col().grow(1.0).min_w(0.0).h_full().min_h(0.0);
     if let Some(dialog) = trash_dialog(s, ink) {
         root = root.child(dialog);
     }
-    root = root.child(toolbar(s, ink, k));
     root = root.child(
         row()
             .grow(1.0)
@@ -54,6 +55,7 @@ pub fn files_view(s: &State, ink: &Ink, k: &Kit) -> El {
                     .shrink()
                     .min_w(pane_layout::PANE_MIN)
                     .border_sides([0.0, 1.0, 0.0, 0.0], ink.border)
+                    .child(aside_header(s, ink, k))
                     .child(
                         if s.editor.files.search.open {
                             search_results(s, ink, k)
@@ -61,7 +63,8 @@ pub fn files_view(s: &State, ink: &Ink, k: &Kit) -> El {
                             tree_pane(s, ink, k)
                         }
                         .w_full()
-                        .h_full(),
+                        .grow(1.0)
+                        .min_h(0.0),
                     )
                     .child(pane_layout::grip(
                         s,
@@ -98,119 +101,188 @@ fn on_filter_change(st: &mut State) {
     st.editor.files.search.open = false;
 }
 
-fn toolbar(s: &State, ink: &Ink, k: &Kit) -> El {
-    let mut bar = row().w_full().h(34.0).px(8.0).gap(6.0).items_center();
-    bar = bar.child(
-        rune_kit::TextInput::new(&s.editor.files.filter)
-            .placeholder("Filter files")
-            .width(Some(220.0))
-            // `on_edit` hands the runtime mutable access to the TextEdit —
-            // without it the field renders but can't be typed into.
-            .on_edit(|st: &mut State| -> &mut rune::edit::TextEdit { &mut st.editor.files.filter })
-            .on_change(|st: &mut State, _tx: &mut Tx| {
-                on_filter_change(st);
-            })
-            // `.width()` is a fixed size, not a cap — `shrink` lets the
-            // field give way (truncating inside) before the toolbar row
-            // pushes Refresh/controls off a narrow window.
-            .build(k)
-            .shrink()
-            .min_w(80.0),
-    );
-    bar = bar.child(rune::spacer());
-    bar = bar
-        .child(toolbar_icon(&theme::FILE_PLUS, "New File", ink, |st| {
-            let dir = selected_dir(st);
-            ask_for_new(st, &dir, false);
-        }))
-        .child(toolbar_icon(&theme::FOLDER_PLUS, "New Folder", ink, |st| {
-            let dir = selected_dir(st);
-            ask_for_new(st, &dir, true);
-        }))
-        .child(toolbar_icon(&theme::REFRESH, "Refresh", ink, refresh_files))
-        .child(toolbar_icon(
-            &theme::COLLAPSE_ALL,
-            "Collapse All",
-            ink,
-            |st| {
-                tree_get_mut(st).collapse_all();
-            },
-        ));
-    col().w_full().child(bar).child(search_row(s, ink, k))
+/// Which tab the aside header shows: 0 `Files`, 1 `Text` (literal content
+/// search), 2 `Context` (ranked). A projection of the pane flag and the search
+/// mode, so the strip, the input's placeholder, and the aside's content can
+/// never disagree.
+fn tab_index(s: &State) -> usize {
+    let search = &s.editor.files.search;
+    if !search.open {
+        0
+    } else if search.mode == SearchMode::Concept {
+        2
+    } else {
+        1
+    }
 }
 
-/// The always-visible search row under the file filter: the search box, the
-/// `Text | Context` switch, and the index status line. No button reveals it.
-fn search_row(s: &State, ink: &Ink, k: &Kit) -> El {
-    let search = &s.editor.files.search;
-    let placeholder = if search.mode == SearchMode::Concept {
-        "Search by context"
-    } else {
-        "Search text"
-    };
-    let mut bar = row()
-        .w_full()
-        .h(34.0)
+/// The aside's header: the `Files | Text | Context` strip with the file actions
+/// menu beside it, then one input under it. The input edits the file filter on
+/// `Files` and the content-search query on the other two tabs; the index status
+/// follows `Context`.
+fn aside_header(s: &State, ink: &Ink, k: &Kit) -> El {
+    let tab = tab_index(s);
+    let strip = row()
+        .min_w(0.0)
+        .h(30.0)
         .px(8.0)
         .gap(6.0)
         .items_center()
-        .border_sides([0.0, 0.0, 1.0, 0.0], ink.border);
-    bar = bar.child(
-        rune_kit::TextInput::new(&s.editor.files.search_edit)
-            .placeholder(placeholder)
-            .width(Some(240.0))
-            .on_edit(|st: &mut State| -> &mut rune::edit::TextEdit {
-                &mut st.editor.files.search_edit
-            })
-            .on_change(|st: &mut State, tx: &mut Tx| {
-                crate::editor::search::on_query_change(st, tx);
-            })
-            .build(k)
-            .grow(1.0)
-            .shrink()
-            .min_w(90.0),
-    );
-    bar = bar.child(mode_switch(search.mode, k));
-    let status = if search.mode == SearchMode::Concept {
-        status_line(&search.index)
-    } else {
-        None
+        .border_sides([0.0, 0.0, 1.0, 0.0], ink.border)
+        .child(
+            row().grow(1.0).shrink().min_w(0.0).child(
+                rune_kit::SegmentedControl::new(&["Files", "Text", "Context"], Some(tab))
+                    .label("Files view")
+                    .width(None)
+                    .on_pick(|st: &mut State, index: usize, tx: &mut Tx| {
+                        pick_tab(st, tx, index);
+                    })
+                    .build(k),
+            ),
+        )
+        .child(action_button(
+            &theme::MORE,
+            "File actions",
+            "files-actions-button",
+            ink,
+            |st| st.editor.files.actions_open = true,
+        ));
+    let filter = tab == 0;
+    let placeholder = match tab {
+        0 => "Filter files",
+        1 => "Search text",
+        _ => "Search by context",
     };
-    if let Some(text) = status {
-        let color = if matches!(search.index, IndexStatus::Failed(_)) {
+    let mut input_row = row().min_w(0.0).h(32.0).px(8.0).gap(6.0).items_center();
+    input_row = input_row.child(
+        rune_kit::TextInput::new(if filter {
+            &s.editor.files.filter
+        } else {
+            &s.editor.files.search_edit
+        })
+        .placeholder(placeholder)
+        .width(None)
+        // `on_edit` hands the runtime mutable access to the TextEdit —
+        // without it the field renders but can't be typed into.
+        .on_edit(move |st: &mut State| -> &mut rune::edit::TextEdit {
+            if filter {
+                &mut st.editor.files.filter
+            } else {
+                &mut st.editor.files.search_edit
+            }
+        })
+        .on_change(move |st: &mut State, tx: &mut Tx| {
+            if filter {
+                on_filter_change(st);
+            } else {
+                crate::editor::search::on_query_change(st, tx);
+            }
+        })
+        .build(k)
+        .grow(1.0)
+        .shrink()
+        .min_w(90.0),
+    );
+    if tab == 2
+        && let Some(text) = status_line(&s.editor.files.search.index)
+    {
+        let color = if matches!(s.editor.files.search.index, IndexStatus::Failed(_)) {
             ink.danger
         } else {
             ink.muted
         };
-        bar = bar.child(
+        input_row = input_row.child(
             theme::txt(&text, T11M_LH, color)
                 .min_w(0.0)
                 .shrink()
                 .truncate_middle(),
         );
     }
-    bar
+    // The column and both rows stretch to the aside's width; padding stays
+    // inside that width, so no header child can cross the trailing edge.
+    col().child(strip).child(input_row)
 }
 
-/// The `Text | Context` switch: a radio group named `Search mode` whose
-/// selected option is exposed. `Text` is `SearchMode::Content`, `Context` is
-/// `SearchMode::Concept`.
-fn mode_switch(mode: SearchMode, k: &Kit) -> El {
-    rune_kit::SegmentedControl::new(
-        &["Text", "Context"],
-        Some(usize::from(mode == SearchMode::Concept)),
-    )
-    .label("Search mode")
-    .fit()
-    .on_pick(|st: &mut State, index: usize, tx: &mut Tx| {
-        let mode = if index == 0 {
-            SearchMode::Content
-        } else {
-            SearchMode::Concept
-        };
+/// A press on the strip: `Files` shows the filtered tree, `Text`/`Context` show
+/// the search pane in that mode. Stored results show at once; otherwise the text
+/// the box already holds arms the debounce.
+fn pick_tab(st: &mut State, tx: &mut Tx, index: usize) {
+    keyboard::clear_edit_focuses(st);
+    if index == 0 {
+        st.editor.files.search.open = false;
+        keyboard::focus_text_end(&mut st.editor.files.filter);
+        return;
+    }
+    let mode = if index == 2 {
+        SearchMode::Concept
+    } else {
+        SearchMode::Content
+    };
+    // Only switch modes when the user actually picked a different one: picking
+    // the same search tab again must keep stored results instead of wiping them.
+    if st.editor.files.search.mode != mode {
         crate::editor::search::set_mode(st, tx, mode);
-    })
-    .build(k)
+    }
+    st.editor.files.search.open = true;
+    keyboard::focus_text_end(&mut st.editor.files.search_edit);
+    let rearm = st.editor.files.search.results.is_none()
+        && st.editor.files.search.pending.is_none()
+        && st.editor.files.search.error.is_none()
+        && st.editor.files.search_edit.text.trim().chars().count()
+            >= crate::editor::search::MIN_QUERY;
+    if rearm {
+        crate::editor::search::on_query_change(st, tx);
+    }
+}
+
+/// The header's `File actions` menu, anchored to its button: create a file or
+/// folder beside the selection, refresh the list, or collapse every folder.
+pub fn actions_menu_layer(s: &State, layer: &mut Vec<El>) -> Option<El> {
+    if s.view != crate::View::Editor || !s.editor.files.actions_open {
+        return None;
+    }
+    Some(
+        Menu::new("files-actions")
+            .anchor("files-actions-button")
+            .open(true)
+            .item(
+                MenuItem::new("New File…")
+                    .icon(&theme::FILE_PLUS)
+                    .on_select(|st: &mut State| {
+                        st.editor.files.actions_open = false;
+                        let dir = selected_dir(st);
+                        ask_for_new(st, &dir, false);
+                    }),
+            )
+            .item(
+                MenuItem::new("New Folder…")
+                    .icon(&theme::FOLDER_PLUS)
+                    .on_select(|st: &mut State| {
+                        st.editor.files.actions_open = false;
+                        let dir = selected_dir(st);
+                        ask_for_new(st, &dir, true);
+                    }),
+            )
+            .separator()
+            .item(
+                MenuItem::new("Refresh")
+                    .icon(&theme::REFRESH)
+                    .on_select(|st: &mut State| {
+                        st.editor.files.actions_open = false;
+                        refresh_files(st);
+                    }),
+            )
+            .item(
+                MenuItem::new("Collapse All")
+                    .icon(&theme::COLLAPSE_ALL)
+                    .on_select(|st: &mut State| {
+                        st.editor.files.actions_open = false;
+                        tree_get_mut(st).collapse_all();
+                    }),
+            )
+            .on_close(|st: &mut State| st.editor.files.actions_open = false)
+            .build(&s.editor.kit, layer),
+    )
 }
 
 fn status_line(status: &IndexStatus) -> Option<String> {
@@ -226,15 +298,16 @@ fn status_line(status: &IndexStatus) -> Option<String> {
     }
 }
 
-/// One icon-only toolbar button, labelled and with a tooltip.
-fn toolbar_icon(
+/// One icon-only header button, labelled and with a tooltip.
+fn action_button(
     icon: &'static rune::Icon,
     label: &'static str,
+    key: &'static str,
     ink: &Ink,
     on_press: fn(&mut State),
 ) -> El {
     rune::el()
-        .key(format!("files-tool:{label}"))
+        .key(key)
         .size(28.0, 28.0)
         .radius(8.0)
         .center()
@@ -1575,7 +1648,16 @@ fn search_results(s: &State, ink: &Ink, k: &Kit) -> El {
         return pane.child(theme::txt(err, T12, ink.danger));
     }
     let Some(results) = &search.results else {
-        return pane.child(theme::txt("Type at least 2 characters", T12, ink.muted));
+        // The pane belongs to the search tab: a short box gets the hint, a
+        // long one is waiting on the debounce or the reply.
+        let text = if s.editor.files.search_edit.text.trim().chars().count()
+            >= crate::editor::search::MIN_QUERY
+        {
+            "Searching…"
+        } else {
+            "Type at least 2 characters"
+        };
+        return pane.child(theme::txt(text, T12, ink.muted));
     };
     let mut list = col()
         .grow(1.0)
@@ -1903,7 +1985,7 @@ mod tests {
         );
     }
 
-    /// The search box is editable with no toggle to press first: typing
+    /// Exactly one input mounts: `Filter files`, on the `Files` tab. Typing it
     /// records the query and arms the debounce (`search.pending`), proving
     /// `on_edit` works.
     #[test]
@@ -1912,14 +1994,17 @@ mod tests {
         let mut rt = Runtime::new(s, files_only, (1100.0, 700.0), Env::new(true, 2.0));
         rt.frame(0.0);
 
-        // Each TextInput mounts a wrapper + field, both role="textbox" —
-        // 2 inputs = 4 elements; the search box is found by its placeholder.
-        assert_eq!(textboxes(&rt).len(), 4, "filter + search inputs mounted");
-        let r = textbox_named(&rt, "Search text").rect;
+        // One input mounts a wrapper + field: exactly two textbox elements.
+        assert_eq!(textboxes(&rt).len(), 2, "one input mounted");
+        assert!(
+            textbox_named(&rt, "Filter files").label.as_deref() == Some("Filter files"),
+            "the input edits the file filter"
+        );
+        let r = textbox_named(&rt, "Filter files").rect;
         click(&mut rt, r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
 
         type_text(&mut rt, "fn main");
-        assert_eq!(rt.state.editor.files.search_edit.text, "fn main");
+        assert_eq!(rt.state.editor.files.filter.text, "fn main");
         let pending = rt
             .state
             .editor
@@ -1928,7 +2013,7 @@ mod tests {
             .pending
             .as_ref()
             .map(|(q, _)| q.clone());
-        assert_eq!(pending.as_deref(), Some("fn main"));
+        assert_eq!(pending.as_deref(), None, "a filter edit never arms search");
     }
 
     fn textbox_named(rt: &Runtime<State>, name: &str) -> rune::ElementInfo {
@@ -1960,33 +2045,191 @@ mod tests {
             .count()
     }
 
+    /// The aside header mounts one `Files view` radiogroup (`Files`, `Text`,
+    /// `Context`, `Files` selected) and exactly one input: `Filter files`. No
+    /// `Search text` input while the tree tab is open.
     #[test]
-    fn the_search_row_is_always_visible_with_a_text_context_switch() {
+    fn the_aside_header_mounts_the_tab_strip_and_one_input() {
         let s = scene();
         let mut rt = Runtime::new(s, files_only, (900.0, 700.0), Env::new(true, 2.0));
         rt.frame(0.0);
 
-        // No toggle: the box and the switch are there before anything is pressed.
-        let els = rt.elements();
         assert!(
-            !els.iter().any(|e| e.label.as_deref() == Some("Search")),
-            "no Search toggle button"
+            rt.elements()
+                .iter()
+                .any(|e| e.role == "radiogroup" && e.label.as_deref() == Some("Files view")),
+            "the strip is a radiogroup named Files view"
+        );
+        for name in ["Files", "Text", "Context"] {
+            assert!(
+                radio(&rt, name).item_selected == (name == "Files"),
+                "segment {name} selected state"
+            );
+        }
+        assert_eq!(
+            textboxes(&rt).len(),
+            2,
+            "one input mounts two textbox elements"
         );
         assert!(
-            els.iter()
-                .any(|e| e.role == "radiogroup" && e.label.as_deref() == Some("Search mode")),
-            "the switch is a radio group named Search mode"
+            textbox_named(&rt, "Filter files").label.as_deref() == Some("Filter files"),
+            "the input edits the file filter"
         );
-        assert!(radio(&rt, "Text").item_selected, "Text is the default");
-        assert!(!radio(&rt, "Context").item_selected);
-        textbox_named(&rt, "Search text");
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|e| e.role == "button" && e.label.as_deref() == Some("File actions")),
+            "the File actions button is mounted"
+        );
+    }
 
-        let r = radio(&rt, "Context").rect;
-        click(&mut rt, r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+    /// Picking `Text` swaps the input to `Search text`; both texts survive the
+    /// switch, and the tree stays filtered by the filter text behind it.
+    #[test]
+    fn picking_text_swaps_the_input_and_keeps_both_texts() {
+        let s = scene();
+        let mut rt = Runtime::new(s, files_only, (900.0, 700.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+
+        let f = textbox_named(&rt, "Filter files").rect;
+        click(&mut rt, f[0] + f[2] / 2.0, f[1] + f[3] / 2.0);
+        type_text(&mut rt, "edit");
+        assert_eq!(rt.state.editor.files.filter.text, "edit");
+        assert!(
+            rt.state.editor.files.model.visible_len() < rt.state.editor.files.paths.len(),
+            "the filter narrowed the tree"
+        );
+
+        let text = radio(&rt, "Text").rect;
+        click(&mut rt, text[0] + text[2] / 2.0, text[1] + text[3] / 2.0);
+        assert_eq!(rt.state.editor.files.search.mode, SearchMode::Content);
+        assert!(rt.state.editor.files.search.open);
+        let boxes = textboxes(&rt);
+        assert_eq!(boxes.len(), 2);
+        assert_eq!(
+            textbox_named(&rt, "Search text").label.as_deref(),
+            Some("Search text")
+        );
+        assert_eq!(rt.state.editor.files.filter.text, "edit");
+        assert_eq!(rt.state.editor.files.search_edit.text, "");
+    }
+
+    /// Stored results survive a round trip through the `Files` tab without a
+    /// new request being issued.
+    #[test]
+    fn switching_tabs_shows_the_stored_results_without_a_new_query() {
+        let s = scene();
+        let mut rt = Runtime::new(s, files_only, (900.0, 700.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+
+        let text = radio(&rt, "Text").rect;
+        click(&mut rt, text[0] + text[2] / 2.0, text[1] + text[3] / 2.0);
+        type_text(&mut rt, "main");
+        rt.update(|s, tx| {
+            crate::editor::search::poll(s, 1.0, tx);
+        });
+        // The reply arrives out of band; store it so the results pane shows.
+        rt.update(|s, _tx| {
+            s.editor.files.search.results = Some(app_core::git_view::GitViewSearch {
+                matches: vec![app_core::git_view::GitViewSearchMatch {
+                    path: "src/main.rs".into(),
+                    line: 1,
+                    text: "fn main() {}".into(),
+                }],
+                truncated: false,
+            });
+        });
+        settle(&mut rt);
+        assert!(rt.state.editor.files.search.open);
+        assert!(rt.state.editor.files.search.pending.is_none());
+        assert_eq!(tree_rows(&rt), 0, "the results replace the tree");
+
+        let files = radio(&rt, "Files").rect;
+        click(
+            &mut rt,
+            files[0] + files[2] / 2.0,
+            files[1] + files[3] / 2.0,
+        );
+        assert!(!rt.state.editor.files.search.open);
+        assert!(tree_rows(&rt) > 0, "the tree shows");
+        assert_eq!(rt.state.editor.files.search.query, "main");
+        assert!(rt.state.editor.files.search.results.is_some());
+
+        let text = radio(&rt, "Text").rect;
+        click(&mut rt, text[0] + text[2] / 2.0, text[1] + text[3] / 2.0);
+        settle(&mut rt);
+        assert!(rt.state.editor.files.search.open);
+        assert_eq!(rt.state.editor.files.search_edit.text, "main");
+        assert!(rt.state.editor.files.search.pending.is_none(), "no re-arm");
+        assert_eq!(tree_rows(&rt), 0, "the stored results show again");
+    }
+
+    /// A query below `MIN_QUERY` keeps the search tab open with its hint.
+    #[test]
+    fn a_short_query_keeps_the_pane_with_the_hint() {
+        let s = scene();
+        let mut rt = Runtime::new(s, files_only, (900.0, 700.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+
+        let text = radio(&rt, "Text").rect;
+        click(&mut rt, text[0] + text[2] / 2.0, text[1] + text[3] / 2.0);
+        let box_ = textbox_named(&rt, "Search text").rect;
+        click(&mut rt, box_[0] + box_[2] / 2.0, box_[1] + box_[3] / 2.0);
+        type_text(&mut rt, "a");
+        settle(&mut rt);
+        assert!(rt.state.editor.files.search.open);
+        assert_eq!(tree_rows(&rt), 0);
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|el| el.text.as_deref() == Some("Type at least 2 characters")),
+            "the short-query hint shows"
+        );
+    }
+
+    /// A long enough query reads `Searching…` while the debounce/reply is in
+    /// flight, never the short-query hint.
+    #[test]
+    fn a_valid_query_reads_searching_before_the_reply() {
+        let s = scene();
+        let mut rt = Runtime::new(s, files_only, (900.0, 700.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+
+        let text = radio(&rt, "Text").rect;
+        click(&mut rt, text[0] + text[2] / 2.0, text[1] + text[3] / 2.0);
+        let box_ = textbox_named(&rt, "Search text").rect;
+        click(&mut rt, box_[0] + box_[2] / 2.0, box_[1] + box_[3] / 2.0);
+        type_text(&mut rt, "main");
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|el| el.text.as_deref() == Some("Searching…")),
+            "a valid query shows Searching… before any reply"
+        );
+        assert!(
+            !rt.elements()
+                .iter()
+                .any(|el| el.text.as_deref() == Some("Type at least 2 characters")),
+            "the short-query hint is gone"
+        );
+    }
+
+    /// Picking `Context` sets Concept mode, the `Search by context` placeholder,
+    /// and each index status line; idle clears them again.
+    #[test]
+    fn the_context_tab_sets_the_mode_and_status() {
+        use crate::editor::state::search_state::IndexStatus;
+        let s = scene();
+        let mut rt = Runtime::new(s, files_only, (900.0, 700.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+
+        let ctx = radio(&rt, "Context").rect;
+        click(&mut rt, ctx[0] + ctx[2] / 2.0, ctx[1] + ctx[3] / 2.0);
         assert_eq!(rt.state.editor.files.search.mode, SearchMode::Concept);
-        assert!(radio(&rt, "Context").item_selected);
-        assert!(!radio(&rt, "Text").item_selected);
-        textbox_named(&rt, "Search by context");
+        assert_eq!(
+            textbox_named(&rt, "Search by context").label.as_deref(),
+            Some("Search by context")
+        );
 
         for (status, text) in [
             (IndexStatus::Building { done: 0, total: 0 }, "Indexing…"),
@@ -2018,6 +2261,33 @@ mod tests {
         }));
     }
 
+    /// With an error already showing, re-picking the same tab neither re-arms
+    /// nor clears the error; editing the box does.
+    #[test]
+    fn picking_the_same_tab_keeps_an_error_without_re_issuing() {
+        let s = scene();
+        let mut rt = Runtime::new(s, files_only, (900.0, 700.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+
+        rt.update(|s, _tx| {
+            s.editor.files.search.open = true;
+            s.editor.files.search.error = Some("boom".into());
+            s.editor.files.search_edit.text = "main".into();
+        });
+        let text = radio(&rt, "Text").rect;
+        click(&mut rt, text[0] + text[2] / 2.0, text[1] + text[3] / 2.0);
+        assert_eq!(rt.state.editor.files.search_edit.text, "main");
+        assert!(rt.state.editor.files.search.pending.is_none());
+        assert!(
+            rt.elements()
+                .iter()
+                .any(|el| el.text.as_deref() == Some("boom")),
+            "the error stays mounted"
+        );
+    }
+
+    /// Editing the file filter shows the tree again and leaves the search
+    /// text, mode, and results stored, so picking `Text` brings them back.
     #[test]
     fn the_aside_follows_the_box_edited_last() {
         let s = scene();
@@ -2025,9 +2295,11 @@ mod tests {
         rt.frame(0.0);
         assert!(tree_rows(&rt) > 0, "the tree shows by default");
 
-        // Typing in the search box and letting the debounce fire shows the results.
-        let r = textbox_named(&rt, "Search text").rect;
-        click(&mut rt, r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        // Picking `Text` and typing the query shows the results.
+        let text = radio(&rt, "Text").rect;
+        click(&mut rt, text[0] + text[2] / 2.0, text[1] + text[3] / 2.0);
+        let box_ = textbox_named(&rt, "Search text").rect;
+        click(&mut rt, box_[0] + box_[2] / 2.0, box_[1] + box_[3] / 2.0);
         type_text(&mut rt, "main");
         rt.update(|s, tx| {
             crate::editor::search::poll(s, 1.0, tx);
@@ -2036,7 +2308,14 @@ mod tests {
         assert!(rt.state.editor.files.search.open);
         assert_eq!(tree_rows(&rt), 0, "the results replace the tree");
 
-        // Typing in the file filter brings the tree back and keeps the search.
+        // Picking `Files` and editing the filter brings the tree back and
+        // keeps the search text and mode.
+        let files = radio(&rt, "Files").rect;
+        click(
+            &mut rt,
+            files[0] + files[2] / 2.0,
+            files[1] + files[3] / 2.0,
+        );
         let f = textbox_named(&rt, "Filter files").rect;
         click(&mut rt, f[0] + f[2] / 2.0, f[1] + f[3] / 2.0);
         type_text(&mut rt, "a");
@@ -2044,6 +2323,124 @@ mod tests {
         assert!(!rt.state.editor.files.search.open);
         assert!(tree_rows(&rt) > 0, "the filtered tree shows");
         assert_eq!(rt.state.editor.files.search_edit.text, "main");
+        assert_eq!(rt.state.editor.files.search.mode, SearchMode::Content);
+    }
+
+    /// Like `main.rs` renders the section: `files_view` plus its menu layer.
+    fn files_with_menu(s: &State, _cx: &mut Cx<State>) -> El {
+        let mut layer = Vec::new();
+        let mut root = files_view(s, &s.ink, &s.editor.kit);
+        if let Some(menu) = actions_menu_layer(s, &mut layer) {
+            root = root.child(menu);
+        }
+        rune_kit::root(root, layer)
+    }
+
+    /// The `File actions` button opens its anchored menu; New File… opens the
+    /// new-entry prompt in the selected folder, and every item closes the menu.
+    #[test]
+    fn the_actions_menu_offers_the_four_items_and_new_file_prompts() {
+        let s = scene();
+        let mut rt = Runtime::new(s, files_with_menu, (900.0, 700.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+
+        assert!(!rt.state.editor.files.actions_open);
+        let button = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.role == "button" && e.label.as_deref() == Some("File actions"))
+            .expect("File actions button mounted");
+        click(&mut rt, button.rect[0] + 5.0, button.rect[1] + 5.0);
+        assert!(rt.state.editor.files.actions_open);
+        rt.frame(1.0 / 60.0);
+        for label in ["New File…", "New Folder…", "Refresh", "Collapse All"] {
+            assert!(
+                rt.elements()
+                    .iter()
+                    .any(|e| e.role == "menuitem" && e.label.as_deref() == Some(label)),
+                "menu item {label} mounted"
+            );
+        }
+        let new_file = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.role == "menuitem" && e.label.as_deref() == Some("New File…"))
+            .expect("New File… item");
+        click(&mut rt, new_file.rect[0] + 5.0, new_file.rect[1] + 5.0);
+        assert!(
+            !rt.state.editor.files.actions_open,
+            "the item closes the menu"
+        );
+        assert_eq!(
+            rt.state.sidebar_input,
+            Some(crate::sidebar::SidebarInput::NewEntry {
+                dir: String::new(),
+                folder: false
+            }),
+            "New File… asks for a file name at the checkout root"
+        );
+    }
+
+    /// Nothing in the header escapes the aside, at the default width and at
+    /// `PANE_MIN` (180 px): labels truncate and the input keeps its minimum.
+    #[test]
+    fn the_header_stays_inside_the_aside() {
+        let mut s = scene();
+        s.editor
+            .history
+            .layout
+            .panes
+            .set(PaneKind::FilesAside, 180.0);
+        let mut rt = Runtime::new(s, files_only, (760.0, 700.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+        for width in [480.0, 280.0, 180.0] {
+            rt.update(|s, _tx| {
+                s.editor
+                    .history
+                    .layout
+                    .panes
+                    .set(PaneKind::FilesAside, width)
+            });
+            // The pane width springs to its target: measure once it has
+            // settled, not mid-animation.
+            settle(&mut rt);
+            // The grip is the aside's last child: its trailing edge is the
+            // aside's right edge at this frame.
+            let grip = rt
+                .elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some("files-pane-grip"))
+                .expect("aside grip mounted");
+            let aside_right = grip.visible[0] + grip.visible[2];
+            for e in rt.elements() {
+                // Header children only: the controls and labels that begin
+                // inside the aside. Section-wide containers and the editor's
+                // own elements start at the aside's edge or right of it, so
+                // they are not this check's subject.
+                let header_role = matches!(
+                    e.role,
+                    "radiogroup" | "radio" | "button" | "textbox" | "text"
+                );
+                if !header_role || e.visible[2] <= 0.5 || e.visible[0] >= aside_right - 0.5 {
+                    continue;
+                }
+                assert!(
+                    e.visible[0] >= -0.5 && e.visible[0] + e.visible[2] <= aside_right + 0.5,
+                    "element role={:?} label={:?} key={:?} rect={:?} escapes the {width}-wide aside (right edge {aside_right})",
+                    e.role,
+                    e.label,
+                    e.key.as_deref(),
+                    e.visible
+                );
+            }
+        }
+        // The input keeps its 90 px minimum at the default width.
+        let boxes = textboxes(&rt);
+        assert!(!boxes.is_empty());
+        assert!(
+            boxes[0].visible[2] >= 90.0 - 1.0,
+            "input is at least 90 px wide"
+        );
     }
 
     /// Desktop parity: a single click on a file row opens it — the press
@@ -3086,7 +3483,7 @@ mod tests {
 
     /// Runtime with the app-level keyboard handler attached, like `main.rs`.
     fn kb_runtime(s: State) -> Runtime<State> {
-        let mut rt = Runtime::new(s, files_only, (900.0, 700.0), Env::new(true, 2.0));
+        let mut rt = Runtime::new(s, files_with_menu, (900.0, 700.0), Env::new(true, 2.0));
         rt.on_key = Some(crate::editor::keyboard::on_key);
         rt.frame(0.0);
         rt
@@ -3225,27 +3622,30 @@ mod tests {
         );
     }
 
-    /// The toolbar's four actions are there; New File asks for a name in the
-    /// selected file's folder, Collapse All closes the tree, and the name
-    /// sends the create.
+    /// The header's four file actions live in the `File actions` menu: New File
+    /// asks for a name in the selected file's folder, Collapse All closes the
+    /// tree, and the name sends the create.
     #[test]
     fn the_toolbar_creates_in_the_selected_folder_and_collapses_all() {
         let (backend, jobs) = crate::editor::backend::channel_backend();
         let mut s = scene();
         s.editor.backend = backend;
         let mut rt = kb_runtime(s);
-        let tool = |rt: &Runtime<State>, label: &str| {
-            rt.elements()
-                .into_iter()
-                .find(|e| e.role == "button" && e.label.as_deref() == Some(label))
-                .unwrap_or_else(|| panic!("{label} button mounted"))
-        };
-        for label in ["New File", "New Folder", "Refresh", "Collapse All"] {
-            tool(&rt, label);
-        }
         click_tree_row(&mut rt, "src");
         click_tree_row(&mut rt, "a.rs");
-        let new_file = tool(&rt, "New File");
+        let actions = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.role == "button" && e.label.as_deref() == Some("File actions"))
+            .expect("File actions button mounted");
+        click(&mut rt, actions.rect[0] + 5.0, actions.rect[1] + 5.0);
+        assert!(rt.state.editor.files.actions_open);
+        rt.frame(1.0 / 60.0);
+        let new_file = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.role == "menuitem" && e.label.as_deref() == Some("New File…"))
+            .expect("New File… item");
         click(&mut rt, new_file.rect[0] + 5.0, new_file.rect[1] + 5.0);
         assert_eq!(
             rt.state.sidebar_input,
@@ -3268,7 +3668,13 @@ mod tests {
         );
 
         assert!(rt.state.editor.files.model.is_expanded("src"));
-        let collapse = tool(&rt, "Collapse All");
+        click(&mut rt, actions.rect[0] + 5.0, actions.rect[1] + 5.0);
+        rt.frame(1.0 / 60.0);
+        let collapse = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.role == "menuitem" && e.label.as_deref() == Some("Collapse All"))
+            .expect("Collapse All item");
         click(&mut rt, collapse.rect[0] + 5.0, collapse.rect[1] + 5.0);
         assert!(!rt.state.editor.files.model.is_expanded("src"));
     }

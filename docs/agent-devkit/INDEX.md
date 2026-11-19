@@ -65,3 +65,4 @@
 - [Agent usage and limit indicators](changes/archive/2026-11-04-agent-usage-limits/design.md) ([tasks](changes/archive/2026-11-04-agent-usage-limits/tasks.md))
 - [Editor sync and conflicts: background refresh, conflict kinds and resolve actions, merge Continue](changes/archive/2026-11-17-editor-sync-and-conflicts/design.md) ([tasks](changes/archive/2026-11-17-editor-sync-and-conflicts/tasks.md), [delta](changes/archive/2026-11-17-editor-sync-and-conflicts/delta.md))
 - [Editor tabs: several open files and one guard dialog](changes/archive/2026-11-17-editor-tabs/design.md) ([tasks](changes/archive/2026-11-17-editor-tabs/tasks.md), [delta](changes/archive/2026-11-17-editor-tabs/delta.md))
+- [Files toolbar tabs: one header in the file-tree aside](changes/archive/files-toolbar-tabs/design.md) ([tasks](changes/archive/files-toolbar-tabs/tasks.md), [delta](changes/archive/files-toolbar-tabs/delta.md))
