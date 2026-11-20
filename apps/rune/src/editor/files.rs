@@ -124,36 +124,48 @@ fn aside_header(s: &State, ink: &Ink, k: &Kit) -> El {
     let tab = tab_index(s);
     let strip = row()
         .min_w(0.0)
-        .h(30.0)
+        // Same height as the editor's open-file tab bar (`tab_bar`), so the
+        // two rows' bottom borders line up across the split — the track sits
+        // flush in the row exactly like the header's Terminal | Editor switch.
+        .h(32.0)
         .px(8.0)
-        .gap(6.0)
         .items_center()
         .border_sides([0.0, 0.0, 1.0, 0.0], ink.border)
         .child(
             row().grow(1.0).shrink().min_w(0.0).child(
                 rune_kit::SegmentedControl::new(&["Files", "Text", "Context"], Some(tab))
                     .label("Files view")
+                    .font(theme::TAB)
+                    .icons(&[&theme::FOLDER_TREE, &theme::WRAP_TEXT, &theme::ROWS_2])
                     .width(None)
+                    .trailing(action_button(
+                        &theme::MORE,
+                        "File actions",
+                        "files-actions-button",
+                        ink,
+                        |st| st.editor.files.actions_open = true,
+                    ))
                     .on_pick(|st: &mut State, index: usize, tx: &mut Tx| {
                         pick_tab(st, tx, index);
                     })
                     .build(k),
             ),
-        )
-        .child(action_button(
-            &theme::MORE,
-            "File actions",
-            "files-actions-button",
-            ink,
-            |st| st.editor.files.actions_open = true,
-        ));
+        );
     let filter = tab == 0;
     let placeholder = match tab {
         0 => "Filter files",
         1 => "Search text",
         _ => "Search by context",
     };
-    let mut input_row = row().min_w(0.0).h(32.0).px(8.0).gap(6.0).items_center();
+    // Same height as the editor's doc bar (`doc_bar`, 30 pt) below the tabs,
+    // plus 2 pt of breathing room so the field clears the tabs' bottom border.
+    let mut input_row = row()
+        .min_w(0.0)
+        .h(34.0)
+        .px(8.0)
+        .py(2.0)
+        .gap(6.0)
+        .items_center();
     input_row = input_row.child(
         rune_kit::TextInput::new(if filter {
             &s.editor.files.filter
@@ -308,12 +320,12 @@ fn action_button(
 ) -> El {
     rune::el()
         .key(key)
-        .size(28.0, 28.0)
-        .radius(8.0)
+        .size(26.0, 26.0)
+        .radius(5.0)
         .center()
         .role("button")
         .label(label)
-        .child(theme::ic(icon, 16.0, ink.text))
+        .child(theme::ic(icon, 14.0, ink.text))
         .hover(ink.text.alpha(0.08))
         .press(ink.text.alpha(0.12))
         .press_scale(0.95)
@@ -1636,16 +1648,31 @@ fn read_only_surface(s: &State, ink: &Ink, k: &Kit) -> El {
         .scroll_bar(k)
 }
 
+/// A status line in the search pane (`Type at least 2 characters`,
+/// `Searching…`, or an error) — the pane's own padding insets it.
+fn search_status(text: &str, color: rune::Color) -> El {
+    theme::txt(text, T12, color)
+}
+
 /// Right-hand pane while content search is open: grouped results that open
-/// the file at the matched line.
+/// the file at the matched line. One common padding for everything inside —
+/// status lines and results share the input's text column (the field's box
+/// sits one 8 pt step further out).
 fn search_results(s: &State, ink: &Ink, k: &Kit) -> El {
-    let pane = col().grow(1.0).min_w(0.0).h_full().min_h(0.0).fill(ink.bg);
+    let pane = col()
+        .grow(1.0)
+        .min_w(0.0)
+        .h_full()
+        .min_h(0.0)
+        .fill(ink.bg)
+        .px(16.0)
+        .pt(8.0);
     let search = &s.editor.files.search;
     if search.searching {
-        return pane.child(theme::txt("Searching…", T12, ink.muted));
+        return pane.child(search_status("Searching…", ink.muted));
     }
     if let Some(err) = &search.error {
-        return pane.child(theme::txt(err, T12, ink.danger));
+        return pane.child(search_status(err, ink.danger));
     }
     let Some(results) = &search.results else {
         // The pane belongs to the search tab: a short box gets the hint, a
@@ -1657,7 +1684,7 @@ fn search_results(s: &State, ink: &Ink, k: &Kit) -> El {
         } else {
             "Type at least 2 characters"
         };
-        return pane.child(theme::txt(text, T12, ink.muted));
+        return pane.child(search_status(text, ink.muted));
     };
     let mut list = col()
         .grow(1.0)

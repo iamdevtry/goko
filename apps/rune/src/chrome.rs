@@ -14,7 +14,7 @@ use crate::editor::navigation::{self, PendingNav};
 use crate::panes::{self, Tab};
 use crate::sidebar;
 use crate::theme::{
-    self, Ink, STATE_SPRING, T10_SUB, T11, T11M, T11M_LH, T12, T12M, T12TN, T14, T14M, T14S,
+    self, Ink, STATE_SPRING, T10_SUB, T11, T11M, T11M_LH, T12, T12M, T12TN, T14, T14M, T14S, TAB,
 };
 use crate::{State, View};
 
@@ -716,8 +716,6 @@ pub fn header(s: &State, ink: &Ink, inset: f32) -> El {
 /// inside the 28–32 pt rows (as the sidebar's compact scale does). Every tab title
 /// and both segment labels are medium weight: the active one is told apart by
 /// colour, so selecting never changes a label's width and nudges its neighbours.
-const TAB: TextStyle = T12M.lh(16.0);
-
 pub fn tab_bar(s: &State, ink: &Ink) -> El {
     let mut tabs = row().grow(1.0).min_w(0.0).items_center().gap(4.0);
     let count = s.visible_tabs().count();

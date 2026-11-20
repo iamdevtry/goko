@@ -11,7 +11,7 @@ enum Width {
     Fit,
 }
 
-use rune::{El, TextStyle, Tx, el, row, text};
+use rune::{El, Icon, TextStyle, Tx, el, icon, row, text};
 
 use crate::{Kit, State};
 
@@ -24,6 +24,9 @@ pub struct SegmentedControl {
     states: Vec<State>,
     pick: Option<Pick>,
     label: Option<String>,
+    font: Option<TextStyle>,
+    icons: Vec<&'static Icon>,
+    trailing: Option<El>,
 }
 
 impl SegmentedControl {
@@ -35,11 +38,30 @@ impl SegmentedControl {
             states: Vec::new(),
             pick: None,
             label: None,
+            font: None,
+            icons: Vec::new(),
+            trailing: None,
         }
     }
     /// The accessible name of the choice the segments make ("View").
     pub fn label(mut self, l: impl Into<String>) -> Self {
         self.label = Some(l.into());
+        self
+    }
+    /// Override the labels' type style (the built-in one is the kit's `ui`).
+    pub fn font(mut self, f: TextStyle) -> Self {
+        self.font = Some(f);
+        self
+    }
+    /// A 14 point icon before each label, paired by index.
+    pub fn icons(mut self, icons: &[&'static Icon]) -> Self {
+        self.icons = icons.to_vec();
+        self
+    }
+    /// An element mounted inside the track after the segments (an action
+    /// button that is not a choice).
+    pub fn trailing(mut self, el: El) -> Self {
+        self.trailing = Some(el);
         self
     }
     /// Width in points (default 232); `None` fills the parent.
@@ -71,15 +93,25 @@ impl SegmentedControl {
     pub fn build(self, k: &Kit) -> El {
         let c = &k.c;
         let n = self.labels.len().max(1);
-        let font = TextStyle { line_height: 13.0, ..k.ty.ui };
+        let font = self.font.unwrap_or(TextStyle { line_height: 13.0, ..k.ty.ui });
+        // Same geometry and colours as the Terminal | Editor view switch
+        // (`chrome::view_switch`): a 3 pt vertical inset around the segments
+        // and a translucent text wash as the only thumb. The track itself
+        // stays transparent and unbordered so it reads on whatever surface
+        // hosts the control, and the segments span it edge to edge.
+        const TRACK_H: f32 = 32.0;
+        const SEG_H: f32 = 26.0;
+        const SEG_INSET: f32 = 3.0;
+        const TRACK_RADIUS: f32 = 8.0;
+        const SEG_RADIUS: f32 = TRACK_RADIUS - SEG_INSET;
         let mut root = row()
             .role("radiogroup")
             .focus_group()
-            .h(28.0)
-            .center_y()
-            .radius(6.0)
-            .fill(c.layer_01)
-            .box_shadow(rune::Shadow { spread: 0.5, color: c.border_base, ..Default::default() });
+            .h(TRACK_H)
+            .gap(2.0)
+            .items_center()
+            .py(SEG_INSET)
+            .radius(TRACK_RADIUS);
         if let Some(l) = self.label {
             root = root.label(l);
         }
@@ -90,17 +122,16 @@ impl SegmentedControl {
         };
         let indicator = || {
             el().key("indicator")
-                .h(28.0)
-                .radius(6.0)
-                .fill(c.bg_base)
-                .box_shadow(rune::Shadow { spread: 0.5, color: c.border_strong, ..Default::default() })
+                .h(SEG_H)
+                .radius(SEG_RADIUS)
+                .fill(c.text_base.alpha(0.10))
                 .token_motion(k.motion.control)
                 .a11y_hidden()
         };
         match (self.selected, self.width) {
             (Some(sel), Width::Points(w)) => {
                 let seg = w / n as f32;
-                root = root.child(indicator().w(seg).absolute(seg * sel as f32, 0.0));
+                root = root.child(indicator().w(seg).absolute(seg * sel as f32, SEG_INSET));
             }
             // The indicator shares the selected segment's cell and slides between cells.
             (Some(sel), Width::Fit) => root = root.child(indicator().grid_cell(sel)),
@@ -128,29 +159,35 @@ impl SegmentedControl {
                 .position_in_set(i + 1, n)
                 .grow(1.0)
                 .shrink()
-                .h(28.0)
-                .px(12.0)
+                .h(SEG_H)
+                .px(4.0)
                 .center()
-                .radius(6.0)
-                .child(label);
+                .radius(SEG_RADIUS)
+                .gap(3.0);
+            if let Some(ic) = self.icons.get(i) {
+                let mut ic = icon(ic, 12.0).key("icon").color(ink);
+                if hovers {
+                    ic = ic.group_color(c.text_base);
+                }
+                seg = seg.child(ic);
+            }
+            seg = seg.child(label);
             if self.width == Width::Fit {
                 seg = seg.grid_cell(i);
             }
             if self.width == Width::Fill && on {
-                seg = seg.fill(c.bg_base).box_shadow(rune::Shadow {
-                    spread: 0.5,
-                    color: c.border_strong,
-                    ..Default::default()
-                });
+                seg = seg.fill(c.text_base.alpha(0.10));
             }
             match st {
                 State::Focus => seg = seg.outline(2.0, 1.0, c.border_focus),
                 State::Disabled => seg = seg.layer_opacity(0.45),
-                State::Hover if !on => seg = seg.fill(c.hover),
                 _ => {}
             }
             if hovers {
-                seg = seg.hover(c.hover).press(crate::press_over(c.hover, c.pressed));
+                // The thumb is the only background: hover lifts the label
+                // colour (above) and a press shrinks slightly, like the view
+                // switch.
+                seg = seg.press_scale(0.96);
             }
             if st != State::Disabled
                 && let Some(p) = &self.pick
@@ -158,6 +195,9 @@ impl SegmentedControl {
                 seg = p(i)(seg);
             }
             root = root.child(seg);
+        }
+        if let Some(t) = self.trailing {
+            root = root.child(t);
         }
         root
     }
