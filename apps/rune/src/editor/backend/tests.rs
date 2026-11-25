@@ -27,6 +27,23 @@ fn text_file(text: &str) -> GitViewFile {
     }
 }
 
+#[test]
+fn doc_code_selects_the_active_or_parked_document() {
+    let mut e = editor();
+    select(&mut e);
+    e.install_doc("a.txt".into(), text_file("a\n"), None);
+    let mut b = text_file("b\n");
+    b.path = "b.txt".into();
+    e.install_doc("b.txt".into(), b, None);
+    assert_eq!(e.doc.as_ref().unwrap().path, "b.txt", "b is active");
+    assert_eq!(e.doc_code("b.txt").unwrap().edit.text, "b\n");
+    assert_eq!(e.doc_code("a.txt").unwrap().edit.text, "a\n", "a parked");
+    assert!(e.doc_code("missing.txt").is_none());
+    e.doc_code_mut("a.txt").unwrap().edit.insert("x");
+    assert_eq!(e.tabs.parked.get("a.txt").unwrap().code.edit.text, "xa\n");
+    assert!(e.doc_code_mut("missing.txt").is_none());
+}
+
 fn reply(
     req: Req,
     generation: u64,

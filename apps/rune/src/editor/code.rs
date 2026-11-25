@@ -92,6 +92,19 @@ fn parse_vim_command(text: &str) -> Option<VimCommand> {
     }
 }
 
+/// The runtime keys of one document's surface: they carry the document path
+/// and never change when its tab activates, so Rune keeps the same nodes (and
+/// their cached text layout) across switches.
+pub fn doc_scroll_key(path: &str) -> String {
+    format!("{SCROLL_KEY}|{}", path.replace('/', "|"))
+}
+pub fn doc_field_key(path: &str) -> String {
+    format!("{FIELD_KEY}|{}", path.replace('/', "|"))
+}
+pub fn doc_text_key(path: &str) -> String {
+    format!("{TEXT_KEY}|{}", path.replace('/', "|"))
+}
+
 /// Code metrics: 13 pt mono on a 19 pt line. The gutter shares the style so
 /// its line boxes track the editor's exactly.
 pub const CODE_STYLE: TextStyle = TextStyle::new(13.0, 400.0).mono().lh(19.0);
@@ -285,7 +298,13 @@ impl CodeState {
         }
         let y = self.reveal_scroll_y(idx, self.scroll_size.get()[1]);
         let x = self.scroll_pos.get()[0];
-        tx.scroll_to_instant(SCROLL_KEY, x, y);
+        tx.scroll_to_instant(doc_scroll_key(&self.path), x, y);
+    }
+
+    /// The scroll offset this document's viewport last reported.
+    #[cfg(test)]
+    pub fn scroll_offset(&self) -> [f32; 2] {
+        self.scroll_pos.get()
     }
 
     /// `line` (1-based) clamped into `[0, line_count)` as a 0-based index.
@@ -569,12 +588,12 @@ impl CodeState {
     /// highlight into view.
     fn select_match(&mut self, range: &Range<usize>, tx: &mut Tx) {
         self.select_range(range.clone(), tx);
-        tx.scroll_into_view_in(SCROLL_KEY, FIND_MATCH_KEY);
+        tx.scroll_into_view_in(doc_scroll_key(&self.path), FIND_MATCH_KEY);
     }
 
     fn select_range(&mut self, range: Range<usize>, tx: &mut Tx) {
         if self.read_only {
-            tx.select_text(TEXT_KEY, range);
+            tx.select_text(doc_text_key(&self.path), range);
         } else {
             self.edit.set_selection(range.start, range.end);
         }
@@ -630,9 +649,12 @@ type VimCommandCallback<S> = Rc<dyn Fn(&mut S, VimCommand, &mut Tx)>;
 /// The code surface view. `get`/`get_mut` reach the parent's [`CodeState`];
 /// callbacks are optional and generic over the app state `S`.
 pub struct Code<S> {
-    get: fn(&S) -> &CodeState,
-    get_mut: fn(&mut S) -> &mut CodeState,
+    get: Rc<dyn Fn(&S) -> &CodeState>,
+    get_mut: Rc<dyn Fn(&mut S) -> &mut CodeState>,
     register: Option<fn(&mut S) -> &mut vim::Register>,
+    /// Whether this surface is the one on screen: an inactive kept-alive
+    /// surface builds no chrome and its field is not focusable.
+    active: bool,
     on_changed: Option<StateCallback<S>>,
     on_save: Option<StateCallback<S>>,
     on_go_to: Option<GoToCallback<S>>,
@@ -646,11 +668,15 @@ pub struct Code<S> {
 }
 
 impl<S: 'static> Code<S> {
-    pub fn new(get: fn(&S) -> &CodeState, get_mut: fn(&mut S) -> &mut CodeState) -> Code<S> {
+    pub fn new(
+        get: impl Fn(&S) -> &CodeState + 'static,
+        get_mut: impl Fn(&mut S) -> &mut CodeState + 'static,
+    ) -> Code<S> {
         Code {
-            get,
-            get_mut,
+            get: Rc::new(get),
+            get_mut: Rc::new(get_mut),
             register: None,
+            active: true,
             on_changed: None,
             on_save: None,
             on_go_to: None,
@@ -662,6 +688,14 @@ impl<S: 'static> Code<S> {
             on_vim_command: None,
             preempt_key: None,
         }
+    }
+
+    /// Whether this surface is the one on screen. An inactive surface is
+    /// kept mounted for its cached text layout but builds no toolbar rows,
+    /// find bar, notices or footer, and its field cannot take focus.
+    pub fn active(mut self, active: bool) -> Code<S> {
+        self.active = active;
+        self
     }
 
     /// Called after every accepted text change (typing, paste, undo, IME
@@ -745,40 +779,60 @@ impl<S: 'static> Code<S> {
     pub fn build(self, s: &S, ink: &Ink, k: &Kit) -> El {
         let code = (self.get)(s);
         let mut root = col().grow(1.0).min_w(0.0).h_full().min_h(0.0).fill(ink.bg);
-        if !code.conflicts.is_empty() {
+        if self.active && !code.conflicts.is_empty() {
             root = root.child(self.conflict_bar(code, ink));
         }
-        if code.find.open {
+        if self.active && code.find.open {
             root = root.child(self.find_bar(s, ink));
         }
-        if code.vim_cmd.is_some() {
+        if self.active && code.vim_cmd.is_some() {
             root = root.child(self.cmd_bar(s, ink));
         }
-        if let Some(notice) = self.notice_bar(code, ink) {
+        if self.active
+            && let Some(notice) = self.notice_bar(code, ink)
+        {
             root = root.child(notice);
         }
-        if let Some(failure) = self.blame_error_bar(code, ink) {
+        if self.active
+            && let Some(failure) = self.blame_error_bar(code, ink)
+        {
             root = root.child(failure);
         }
+        // The inactive surfaces keep the gutter and blame column's exact
+        // widths (so the field's wrapped layout stays reusable) but build no
+        // text in them: their line numbers and annotation are not visible and
+        // would cost a rebuild on every frame.
         let mut surface = row()
             .grow(1.0)
             .min_w(0.0)
             .min_h(0.0)
-            .child(gutter_el(code, ink))
+            .child(if self.active {
+                gutter_el(code, ink)
+            } else {
+                gutter_shell(code, ink)
+            })
             .child(self.surface(s, ink, k));
         // The blame column is a sibling of the scroll surface: it scrolls
         // with the code. It stays mounted while the draft is dirty (blank),
         // or the code area would jump by the column's width on the first key.
         if code.blame_enabled {
-            surface = surface.child(blame_el(code, ink, self.on_blame_open.clone()));
+            surface = surface.child(if self.active {
+                blame_el(code, ink, self.on_blame_open.clone())
+            } else {
+                blame_shell(ink)
+            });
         }
-        root.child(surface).child(self.footer(s, ink))
+        let mut root = root.child(surface);
+        if self.active {
+            root = root.child(self.footer(s, ink));
+        }
+        root
     }
 
     /// Find bar: query field, match count, case toggle, prev/next/close.
     fn find_bar(&self, s: &S, ink: &Ink) -> El {
         let code = (self.get)(s);
-        let get_mut = self.get_mut;
+        let get_mut = Rc::clone(&self.get_mut);
         let preempt = self.preempt_key.clone();
         let mut bar = row()
             .w_full()
@@ -788,6 +842,7 @@ impl<S: 'static> Code<S> {
             .items_center()
             .fill(ink.panel)
             .border_sides([0.0, 0.0, 1.0, 0.0], ink.border);
+        let edit_get = Rc::clone(&get_mut);
         bar = bar.child(
             text_input(&code.find.query, QUERY_STYLE)
                 .single_line()
@@ -795,69 +850,80 @@ impl<S: 'static> Code<S> {
                 .w(180.0)
                 .color(ink.text)
                 .caret(ink.text, ink.accent.alpha(0.3))
-                .on_edit(move |st: &mut S| -> &mut TextEdit { &mut get_mut(st).find.query })
-                .on_input_change(move |st: &mut S, tx: &mut Tx| {
-                    let code = get_mut(st);
-                    code.find.refresh(&code.edit.text);
-                    if code.vim_search.is_some() {
-                        return;
-                    }
-                    if let Some(r) = code.find.active_range() {
-                        code.select_match(&r, tx);
+                .on_edit(move |st: &mut S| -> &mut TextEdit { &mut edit_get(st).find.query })
+                .on_input_change({
+                    let get_mut = Rc::clone(&get_mut);
+                    move |st: &mut S, tx: &mut Tx| {
+                        let code = get_mut(st);
+                        code.find.refresh(&code.edit.text);
+                        if code.vim_search.is_some() {
+                            return;
+                        }
+                        if let Some(r) = code.find.active_range() {
+                            code.select_match(&r, tx);
+                        }
                     }
                 })
-                .on_input_key(move |st: &mut S, ev: &KeyEvent, tx: &mut Tx| -> bool {
-                    if preempt.as_ref().is_some_and(|f| f(st, ev, tx)) {
-                        return true;
-                    }
-                    let code = get_mut(st);
-                    match &ev.key {
-                        Key::Escape => {
-                            if code.vim_search.is_some() {
-                                code.cancel_vim_search(tx);
-                            } else {
-                                code.close_find(tx);
-                            }
-                            true
+                .on_input_key({
+                    let get_mut = Rc::clone(&get_mut);
+                    let preempt = preempt.clone();
+                    move |st: &mut S, ev: &KeyEvent, tx: &mut Tx| -> bool {
+                        if preempt.as_ref().is_some_and(|f| f(st, ev, tx)) {
+                            return true;
                         }
-                        Key::Enter => {
-                            if code.vim_search.is_some() {
-                                code.commit_vim_search(tx);
-                            } else if ev.mods.shift {
-                                code.find_prev(tx);
-                            } else {
-                                code.find_next(tx);
+                        let code = get_mut(st);
+                        match &ev.key {
+                            Key::Escape => {
+                                if code.vim_search.is_some() {
+                                    code.cancel_vim_search(tx);
+                                } else {
+                                    code.close_find(tx);
+                                }
+                                true
                             }
-                            true
+                            Key::Enter => {
+                                if code.vim_search.is_some() {
+                                    code.commit_vim_search(tx);
+                                } else if ev.mods.shift {
+                                    code.find_prev(tx);
+                                } else {
+                                    code.find_next(tx);
+                                }
+                                true
+                            }
+                            _ => false,
                         }
-                        _ => false,
                     }
                 }),
         );
         bar = bar.child(theme::txt(&code.find.count_label(), T12, ink.muted).min_w(58.0));
         let case = code.find.case_sensitive;
-        bar = bar.child(
-            theme::btn_sm("Aa", None, case, ink).on_press_tx(move |st, _tx| {
+        bar = bar.child(theme::btn_sm("Aa", None, case, ink).on_press_tx({
+            let get_mut = Rc::clone(&get_mut);
+            move |st, _tx| {
                 let code = get_mut(st);
                 code.find.case_sensitive = !code.find.case_sensitive;
                 code.find.refresh(&code.edit.text);
-            }),
-        );
-        bar = bar.child(
-            theme::btn_sm("Prev", None, false, ink).on_press_tx(move |st, tx| {
+            }
+        }));
+        bar = bar.child(theme::btn_sm("Prev", None, false, ink).on_press_tx({
+            let get_mut = Rc::clone(&get_mut);
+            move |st, tx| {
                 let _ = get_mut(st).find_prev(tx);
-            }),
-        );
-        bar = bar.child(
-            theme::btn_sm("Next", None, false, ink).on_press_tx(move |st, tx| {
+            }
+        }));
+        bar = bar.child(theme::btn_sm("Next", None, false, ink).on_press_tx({
+            let get_mut = Rc::clone(&get_mut);
+            move |st, tx| {
                 let _ = get_mut(st).find_next(tx);
-            }),
-        );
-        bar.child(
-            theme::btn_sm("Close", None, false, ink).on_press_tx(move |st, tx| {
+            }
+        }));
+        bar.child(theme::btn_sm("Close", None, false, ink).on_press_tx({
+            let get_mut = Rc::clone(&get_mut);
+            move |st, tx| {
                 get_mut(st).close_find(tx);
-            }),
-        )
+            }
+        }))
     }
 
     /// The Vim `:` bar: a prompt, the command input and an inline error.
@@ -971,7 +1037,7 @@ impl<S: 'static> Code<S> {
         let scroll_pos = code.scroll_pos.clone();
         let scroll_size = code.scroll_size.clone();
         let scroll = col()
-            .key(SCROLL_KEY)
+            .key(doc_scroll_key(&code.path))
             .grow(1.0)
             .min_w(0.0)
             .h_full()
@@ -1009,7 +1075,7 @@ impl<S: 'static> Code<S> {
             ] {
                 let block = block.clone();
                 let revision = code.revision;
-                let get_mut = self.get_mut;
+                let get_mut = Rc::clone(&self.get_mut);
                 let changed = self.on_changed.clone();
                 actions = actions.child(
                     theme::btn_sm(label, None, false, ink)
@@ -1024,7 +1090,7 @@ impl<S: 'static> Code<S> {
                             let replacement = block.replacement(&code.edit.text, choice);
                             code.edit.set_selection(block.range.start, block.range.end);
                             code.edit.insert(&replacement);
-                            notify_changed(st, tx, get_mut, &changed);
+                            notify_changed(st, tx, &get_mut, &changed);
                             get_mut(st).edit.focused = true;
                         }),
                 );
@@ -1049,7 +1115,7 @@ impl<S: 'static> Code<S> {
             ink.warning,
         ));
         for (label, previous) in [("Previous conflict", true), ("Next conflict", false)] {
-            let get_mut = self.get_mut;
+            let get_mut = Rc::clone(&self.get_mut);
             bar = bar.child(theme::btn_sm(label, None, false, ink).on_press_tx(
                 move |st: &mut S, tx| {
                     let code = get_mut(st);
@@ -1140,7 +1206,7 @@ impl<S: 'static> Code<S> {
     fn blame_chip(&self, s: &S, ink: &Ink) -> El {
         let code = (self.get)(s);
         let enabled = code.blame_enabled;
-        let get = self.get;
+        let get = Rc::clone(&self.get);
         let on_blame = self.on_blame.clone();
         let color = if enabled { ink.accent } else { ink.muted };
         row()
@@ -1174,7 +1240,7 @@ impl<S: 'static> Code<S> {
         } else {
             unit.label()
         };
-        let get = self.get;
+        let get = Rc::clone(&self.get);
         let on_indent = self.on_indent.clone();
         theme::btn_sm(&label, None, false, ink).on_press_tx(move |st, tx| {
             let next = (get)(st).indent_choice.next();
@@ -1208,12 +1274,12 @@ impl<S: 'static> Code<S> {
             return text(code.edit.text.as_str())
                 .font(CODE_STYLE)
                 .color(ink.text)
-                .key(TEXT_KEY)
+                .key(doc_text_key(&code.path))
                 .selectable(true)
                 .spans(spans)
                 .text_highlights(highlights);
         }
-        let get_mut = self.get_mut;
+        let get_mut = Rc::clone(&self.get_mut);
         let on_changed = self.on_changed.clone();
         let on_submit_changed = self.on_changed.clone();
         let on_changed_key = self.on_changed.clone();
@@ -1228,42 +1294,54 @@ impl<S: 'static> Code<S> {
         } else {
             ink.text
         };
+        let edit_get = Rc::clone(&get_mut);
         let mut field = text_input(&code.edit, CODE_STYLE)
             .grow(1.0)
             .color(ink.text)
             .caret(caret_color, ink.accent.alpha(0.3))
-            .key(FIELD_KEY)
+            .key(doc_field_key(&code.path))
+            .focusable(self.active)
             .spans(spans)
             .text_highlights(highlights)
-            .on_edit(move |st: &mut S| -> &mut TextEdit { &mut get_mut(st).edit })
-            .on_input_change(move |st: &mut S, tx: &mut Tx| {
-                // Native input (an IME commit, a paste) must not edit outside
-                // Insert: the IME cannot be disabled at the pinned Rune rev, so
-                // revert the change instead of letting Normal mode corrupt the
-                // buffer.
-                let code = get_mut(st);
-                if code.vim.enabled && code.vim.mode != vim::Mode::Insert {
-                    code.edit.undo();
-                }
-                notify_changed(st, tx, get_mut, &on_changed);
-            })
-            .on_input_key(move |st: &mut S, ev: &KeyEvent, tx: &mut Tx| -> bool {
-                if preempt.as_ref().is_some_and(|f| f(st, ev, tx)) {
-                    return true;
-                }
-                field_key(st, ev, tx, get_mut, register, &on_save, &on_changed_key)
-            })
-            .on_submit(move |st: &mut S, tx: &mut Tx| {
-                // Enter keeps the line's indent (plus one level after an
-                // opener) — the inserted text still routes through the same
-                // change notification or revision/gutter/find state stales.
-                {
+            .on_edit(move |st: &mut S| -> &mut TextEdit { &mut edit_get(st).edit })
+            .on_input_change({
+                let get_mut = Rc::clone(&get_mut);
+                move |st: &mut S, tx: &mut Tx| {
+                    // Native input (an IME commit, a paste) must not edit outside
+                    // Insert: the IME cannot be disabled at the pinned Rune rev, so
+                    // revert the change instead of letting Normal mode corrupt the
+                    // buffer.
                     let code = get_mut(st);
-                    let (a, b) = code.edit.range();
-                    let ins = indent::auto_indent(&code.edit.text, a.min(b), code.indent_unit);
-                    code.edit.insert(&ins);
+                    if code.vim.enabled && code.vim.mode != vim::Mode::Insert {
+                        code.edit.undo();
+                    }
+                    notify_changed(st, tx, &get_mut, &on_changed);
                 }
-                notify_changed(st, tx, get_mut, &on_submit_changed);
+            })
+            .on_input_key({
+                let get_mut = Rc::clone(&get_mut);
+                let preempt = preempt.clone();
+                move |st: &mut S, ev: &KeyEvent, tx: &mut Tx| -> bool {
+                    if preempt.as_ref().is_some_and(|f| f(st, ev, tx)) {
+                        return true;
+                    }
+                    field_key(st, ev, tx, &get_mut, register, &on_save, &on_changed_key)
+                }
+            })
+            .on_submit({
+                let get_mut = Rc::clone(&get_mut);
+                move |st: &mut S, tx: &mut Tx| {
+                    // Enter keeps the line's indent (plus one level after an
+                    // opener) — the inserted text still routes through the same
+                    // change notification or revision/gutter/find state stales.
+                    {
+                        let code = get_mut(st);
+                        let (a, b) = code.edit.range();
+                        let ins = indent::auto_indent(&code.edit.text, a.min(b), code.indent_unit);
+                        code.edit.insert(&ins);
+                    }
+                    notify_changed(st, tx, &get_mut, &on_submit_changed);
+                }
             });
         if let Some(cb) = self.on_secondary.clone() {
             field = field.on_secondary_press(move |st: &mut S, p, tx: &mut Tx| cb(st, p, tx));
@@ -1282,7 +1360,7 @@ impl<S: 'static> Code<S> {
         if links.is_empty() {
             return None;
         }
-        let (get, on_go_to) = (self.get, self.on_go_to.clone());
+        let (get, on_go_to) = (Rc::clone(&self.get), self.on_go_to.clone());
         let mut ov = text(code.edit.text.as_str())
             .font(CODE_STYLE)
             .color(Color::TRANSPARENT)
@@ -1368,7 +1446,7 @@ impl<S: 'static> Code<S> {
 fn notify_changed<S: 'static>(
     st: &mut S,
     tx: &mut Tx,
-    get_mut: fn(&mut S) -> &mut CodeState,
+    get_mut: &Rc<dyn Fn(&mut S) -> &mut CodeState>,
     on_changed: &Option<StateCallback<S>>,
 ) {
     get_mut(st).text_edited();
@@ -1384,7 +1462,7 @@ fn field_key<S: 'static>(
     st: &mut S,
     ev: &KeyEvent,
     tx: &mut Tx,
-    get_mut: fn(&mut S) -> &mut CodeState,
+    get_mut: &Rc<dyn Fn(&mut S) -> &mut CodeState>,
     register: Option<fn(&mut S) -> &mut vim::Register>,
     on_save: &Option<StateCallback<S>>,
     on_changed: &Option<StateCallback<S>>,
@@ -1465,7 +1543,7 @@ fn field_key<S: 'static>(
 fn vim_key_for<S: 'static>(
     st: &mut S,
     ev: &KeyEvent,
-    get_mut: fn(&mut S) -> &mut CodeState,
+    get_mut: &Rc<dyn Fn(&mut S) -> &mut CodeState>,
 ) -> Option<vim::Key> {
     let code = get_mut(st);
     if !code.vim.enabled || code.read_only {
@@ -1517,7 +1595,7 @@ fn vim_key(ev: &KeyEvent) -> Option<vim::Key> {
 fn apply_vim_effects<S: 'static>(
     st: &mut S,
     tx: &mut Tx,
-    get_mut: fn(&mut S) -> &mut CodeState,
+    get_mut: &Rc<dyn Fn(&mut S) -> &mut CodeState>,
     register: Option<fn(&mut S) -> &mut vim::Register>,
     on_changed: &Option<StateCallback<S>>,
     effects: Vec<vim::Effect>,
@@ -1883,6 +1961,18 @@ fn gutter_el(code: &CodeState, ink: &Ink) -> El {
     gutter
 }
 
+/// The gutter's box at its exact width, with no numbers or bars: an inactive
+/// kept-alive surface needs the width (the field's wrap layout depends on it)
+/// but nothing to draw.
+fn gutter_shell(code: &CodeState, ink: &Ink) -> El {
+    col()
+        .w(code.gutter_width())
+        .h_full()
+        .fill(ink.panel)
+        .border_sides([0.0, 1.0, 0.0, 0.0], ink.border)
+        .clip_rounded(0.0)
+}
+
 /// Inline-blame column: the caret line's annotation, shifted by the same live
 /// scroll offset the gutter uses so it lines up with its line. It is placed by
 /// line height, not by padding the text with blank rows, so building it costs
@@ -1931,6 +2021,17 @@ fn blame_el<S: 'static>(code: &CodeState, ink: &Ink, on_open: Option<BlameOpenCa
                 .child(line)
                 .live_offset(&shift),
         )
+}
+
+/// The blame column's box at its exact width, with no annotation: an inactive
+/// kept-alive surface needs the width for the field's layout, not the text.
+fn blame_shell(ink: &Ink) -> El {
+    col()
+        .w(BLAME_WIDTH)
+        .h_full()
+        .fill(ink.bg)
+        .border_sides([1.0, 0.0, 0.0, 0.0], ink.border)
+        .clip_rounded(0.0)
 }
 
 /// Token hues on the editor surface: VS Code Dark+'s on a dark palette,
@@ -2655,12 +2756,12 @@ mod tests {
             let field = rt
                 .elements()
                 .into_iter()
-                .find(|e| e.key.as_deref() == Some(FIELD_KEY))
+                .find(|e| e.key.as_deref() == Some(doc_field_key("a.rs").as_str()))
                 .unwrap();
             let viewport = rt
                 .elements()
                 .into_iter()
-                .find(|e| e.key.as_deref() == Some(SCROLL_KEY))
+                .find(|e| e.key.as_deref() == Some(doc_scroll_key("a.rs").as_str()))
                 .unwrap();
             assert!(
                 field.rect[3] >= viewport.rect[3],

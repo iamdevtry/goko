@@ -145,6 +145,32 @@ fn name_tint(status: &str) -> bool {
     matches!(status, "modified" | "added" | "deleted" | "untracked")
 }
 
+/// The tone a status paints a changed file with: its name in the Files tree
+/// and the dot on its tab. Every surface that marks a change reads this
+/// table, so one status reads the same everywhere.
+pub(crate) fn status_tone(status: &str, ink: &Ink) -> Option<rune::Color> {
+    Some(match status {
+        "modified" | "typechange" => ink.warning,
+        "added" | "untracked" => ink.success,
+        "deleted" => ink.danger,
+        "renamed" | "copied" => ink.accent,
+        _ => return None,
+    })
+}
+
+/// How significant a status is when a folder summarises the changes beneath
+/// it: lower is more important. Conflict kinds are the strongest and rank 0
+/// where the folder tone is folded in; this table covers the file statuses.
+pub(crate) fn status_rank(status: &str) -> Option<u8> {
+    Some(match status {
+        "deleted" => 1,
+        "modified" | "typechange" => 2,
+        "added" | "untracked" => 3,
+        "renamed" | "copied" => 4,
+        _ => return None,
+    })
+}
+
 /// What the row says after its name: the status word plus its change
 /// counts, in words (the glyphs themselves stay out of the label).
 pub(crate) fn entry_description(entry: &app_core::git_view::StatusEntry) -> String {
@@ -1136,7 +1162,7 @@ pub(crate) fn file_item(
         );
     }
     if name_tint(entry.status)
-        && let Some((_, c)) = status_letter(entry.status, ink)
+        && let Some(c) = status_tone(entry.status, ink)
     {
         item = item.label_color(c);
     }
@@ -1680,6 +1706,43 @@ mod tests {
         assert_eq!(status_label("added-by-them"), "Added by them");
         assert_eq!(status_label("modified"), "Modified");
         assert_eq!(status_label("future"), "Changed");
+    }
+
+    #[test]
+    fn status_tone_covers_each_documented_status() {
+        let ink = Ink::new();
+        for status in ["modified", "typechange"] {
+            assert_eq!(status_tone(status, &ink), Some(ink.warning), "{status}");
+        }
+        for status in ["added", "untracked"] {
+            assert_eq!(status_tone(status, &ink), Some(ink.success), "{status}");
+        }
+        assert_eq!(status_tone("deleted", &ink), Some(ink.danger));
+        for status in ["renamed", "copied"] {
+            assert_eq!(status_tone(status, &ink), Some(ink.accent), "{status}");
+        }
+        assert_eq!(status_tone("both-modified", &ink), None, "a conflict kind");
+        assert_eq!(status_tone("future", &ink), None, "an unknown status");
+    }
+
+    #[test]
+    fn status_rank_orders_each_status() {
+        assert_eq!(status_rank("deleted"), Some(1));
+        for status in ["modified", "typechange"] {
+            assert_eq!(status_rank(status), Some(2), "{status}");
+        }
+        for status in ["added", "untracked"] {
+            assert_eq!(status_rank(status), Some(3), "{status}");
+        }
+        for status in ["renamed", "copied"] {
+            assert_eq!(status_rank(status), Some(4), "{status}");
+        }
+        assert_eq!(status_rank("both-modified"), None, "a conflict kind");
+        assert_eq!(status_rank("future"), None, "an unknown status");
+        // A deletion outranks an edit, which outranks an addition.
+        assert!(status_rank("deleted") < status_rank("modified"));
+        assert!(status_rank("modified") < status_rank("added"));
+        assert!(status_rank("added") < status_rank("renamed"));
     }
 
     #[test]

@@ -7,7 +7,9 @@
 //! column fed by the same text; the code owner's `code.rs` can later swap
 //! this surface behind the same `OpenDoc` state.
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::rc::Rc;
 
 use rune::{El, KeyEvent, Tx, col, row};
 use rune_kit::{
@@ -36,6 +38,7 @@ pub const LIST_ASIDE_SIDE_KEY: &str = "goko.editor.list_side";
 /// the aside swaps content like the desktop `SplitPane`, the editor flexes to
 /// the remaining width. `list_aside_side` docks the aside left or right.
 pub fn files_view(s: &State, ink: &Ink, k: &Kit) -> El {
+    let marks = Rc::new(change_marks(s, ink));
     let mut root = col().grow(1.0).min_w(0.0).h_full().min_h(0.0);
     if let Some(dialog) = trash_dialog(s, ink) {
         root = root.child(dialog);
@@ -68,7 +71,7 @@ pub fn files_view(s: &State, ink: &Ink, k: &Kit) -> El {
             if s.editor.files.search.open {
                 search_results(s, ink, k)
             } else {
-                tree_pane(s, ink, k)
+                tree_pane(s, ink, k, &marks)
             }
             .w_full()
             .h_full(),
@@ -84,7 +87,7 @@ pub fn files_view(s: &State, ink: &Ink, k: &Kit) -> El {
         .min_w(pane_layout::SIBLING_MIN)
         .h_full()
         .min_h(0.0)
-        .child(tab_bar(s, ink))
+        .child(tab_bar(s, ink, &marks.files))
         .child(doc_bar(s, ink))
         .child(editor_pane(s, ink, k).grow(1.0).min_w(0.0).h_full());
     let mut split = row()
@@ -346,7 +349,7 @@ fn files_queue_full(s: &mut State) {
     s.editor.notice = Some(crate::editor::state::Notice { text, stale: false });
 }
 
-fn tree_pane(s: &State, ink: &Ink, k: &Kit) -> El {
+fn tree_pane(s: &State, ink: &Ink, k: &Kit, marks: &Rc<ChangeMarks>) -> El {
     if s.editor.files.paths.is_empty() {
         let (label, tone) = if s.editor.files.loading {
             ("Loading files…".to_string(), ink.muted)
@@ -362,11 +365,27 @@ fn tree_pane(s: &State, ink: &Ink, k: &Kit) -> El {
             .child(theme::txt(&label, T12, tone));
     }
     let dim = ink.muted;
+    // The row closure outlives this call, so it shares the frame's marks
+    // instead of borrowing them; one refcount bump per render.
+    let marks = Rc::clone(marks);
     Tree::new(tree_get, tree_get_mut, FileNode::label)
         .row(move |node, row| {
             let item = TreeItem::file(node, row);
             match node.data {
-                Some(FileMark::Tracked) | None => item,
+                Some(FileMark::Tracked) | None => {
+                    // A changed file's name takes its status tone; a folder
+                    // takes the most significant tone beneath it, so a
+                    // collapsed folder still shows that it holds changes.
+                    let tone = if node.dir {
+                        marks.dirs.get(&node.path)
+                    } else {
+                        marks.files.get(&node.path).map(|(tone, _)| tone)
+                    };
+                    match tone {
+                        Some(tone) => item.label_color(*tone),
+                        None => item,
+                    }
+                }
                 // Ignored by Git: dimmed like VS Code; a collapsed ignored
                 // directory keeps its folder icon.
                 Some(FileMark::Ignored) => item.label_color(dim).icon_color(dim),
@@ -848,16 +867,23 @@ pub fn request_doc_load(s: &mut State, path: &str, line: Option<u64>) {
     }
 }
 
+/// The Changes data the editor holds for THIS checkout, or `None` when it is
+/// absent or belongs to another checkout — the freshness check the doc bar
+/// and every change mark share.
+fn fresh_changes(s: &State) -> Option<&app_core::git_view::GitViewChanges> {
+    let changes = &s.editor.changes;
+    if changes.checkout.is_none() || changes.checkout != s.editor.checkout_key {
+        return None;
+    }
+    changes.data.as_ref()
+}
+
 /// The Changes layer `path` currently sits in, freshest data for THIS
 /// checkout only — desktop `layerFor` priority: conflict, staged, unstaged,
 /// untracked. `None` when changes data is absent, belongs to another
 /// checkout, or the path has no entry.
 fn changed_layer(s: &State, path: &str) -> Option<&'static str> {
-    let changes = &s.editor.changes;
-    if changes.checkout.is_none() || changes.checkout != s.editor.checkout_key {
-        return None;
-    }
-    let data = changes.data.as_ref()?;
+    let data = fresh_changes(s)?;
     let has = |entries: &[app_core::git_view::StatusEntry]| entries.iter().any(|e| e.path == path);
     if has(&data.conflicts) {
         Some("conflict")
@@ -869,6 +895,81 @@ fn changed_layer(s: &State, path: &str) -> Option<&'static str> {
         Some("untracked")
     } else {
         None
+    }
+}
+
+/// A changed path's mark: the tone its name in the tree and its tab dot take,
+/// and the status word the tab's accessible label names.
+type ChangeMark = (rune::Color, &'static str);
+
+/// One render's marks: per-file tone and status word (rows and tabs), and
+/// per-folder tone — the most significant change anywhere beneath it.
+struct ChangeMarks {
+    files: HashMap<String, ChangeMark>,
+    dirs: HashMap<String, rune::Color>,
+}
+
+/// One mark per changed path, from the freshest Changes data for this
+/// checkout: conflict → unstaged → staged → untracked, so the tree describes
+/// the working tree (the file on disk). Every ancestor folder records the
+/// most significant status beneath it (conflict, deleted, modified, added,
+/// renamed), so a collapsed folder shows that it holds changes. Empty without
+/// fresh data; the marks live for one render and are dropped with the frame.
+fn change_marks(s: &State, ink: &Ink) -> ChangeMarks {
+    let mut files = HashMap::new();
+    let mut dirs: HashMap<String, (u8, rune::Color)> = HashMap::new();
+    let Some(data) = fresh_changes(s) else {
+        return ChangeMarks {
+            files,
+            dirs: HashMap::new(),
+        };
+    };
+    // Insert in reverse priority order, so a higher-priority group's mark
+    // replaces a lower one's for the same path.
+    for entries in [&data.untracked, &data.staged, &data.unstaged] {
+        for entry in entries {
+            if let Some(tone) = crate::editor::changes::status_tone(entry.status, ink) {
+                let status = crate::editor::changes::status_label(entry.status);
+                files.insert(entry.path.clone(), (tone, status));
+                if let Some(rank) = crate::editor::changes::status_rank(entry.status) {
+                    remember_folder(&mut dirs, &entry.path, rank, tone);
+                }
+            }
+        }
+    }
+    for entry in &data.conflicts {
+        files.insert(
+            entry.path.clone(),
+            (
+                ink.danger,
+                crate::editor::changes::status_label(entry.status),
+            ),
+        );
+        // A conflict is the strongest reason a folder can show.
+        remember_folder(&mut dirs, &entry.path, 0, ink.danger);
+    }
+    ChangeMarks {
+        files,
+        dirs: dirs
+            .into_iter()
+            .map(|(dir, (_, tone))| (dir, tone))
+            .collect(),
+    }
+}
+
+/// Fold `path`'s change into each ancestor folder's tone, keeping the most
+/// significant status (a lower rank wins; conflicts are rank 0).
+fn remember_folder(
+    dirs: &mut HashMap<String, (u8, rune::Color)>,
+    path: &str,
+    rank: u8,
+    tone: rune::Color,
+) {
+    for dir in path.match_indices('/').rev().map(|(i, _)| &path[..i]) {
+        let slot = dirs.entry(dir.to_string()).or_insert((rank, tone));
+        if rank < slot.0 {
+            *slot = (rank, tone);
+        }
     }
 }
 
@@ -965,7 +1066,7 @@ pub fn stage_resolved_doc(ed: &mut crate::editor::state::EditorState) {
 /// The editor's tab strip: one pill per open tab in open order, hidden
 /// with no document. The strip scrolls horizontally when the tabs outgrow
 /// the column instead of wrapping — `doc_bar` below it already wraps.
-fn tab_bar(s: &State, ink: &Ink) -> El {
+fn tab_bar(s: &State, ink: &Ink, marks: &HashMap<String, ChangeMark>) -> El {
     let Some(active) = s.editor.doc.as_ref() else {
         return col().w_full().h(0.0);
     };
@@ -978,7 +1079,7 @@ fn tab_bar(s: &State, ink: &Ink) -> El {
     };
     let mut strip = row().items_center().gap(4.0);
     for path in &order {
-        strip = strip.child(doc_tab(s, ink, &order, path));
+        strip = strip.child(doc_tab(s, ink, &order, path, marks));
     }
     strip
         .w_full()
@@ -990,10 +1091,18 @@ fn tab_bar(s: &State, ink: &Ink) -> El {
         .scroll_x()
 }
 
-/// One tab: `•` when its document is dirty (active or parked), the file
-/// name — enough of its parent path to stay unique — and a × close button.
-/// The whole pill is the switch, the full path its help.
-fn doc_tab(s: &State, ink: &Ink, order: &[String], path: &str) -> El {
+/// One tab: a status dot for a Git change, `•` when its document is dirty
+/// (active or parked), the file name — enough of its parent path to stay
+/// unique — and a × close button. The whole pill is the switch, the full
+/// path its help, and its accessible label names the status before
+/// "unsaved".
+fn doc_tab(
+    s: &State,
+    ink: &Ink,
+    order: &[String],
+    path: &str,
+    marks: &HashMap<String, ChangeMark>,
+) -> El {
     let active = s.editor.doc.as_ref().is_some_and(|d| d.path == *path);
     let dirty = if active {
         s.editor.doc.as_ref().is_some_and(|d| d.dirty())
@@ -1003,7 +1112,9 @@ fn doc_tab(s: &State, ink: &Ink, order: &[String], path: &str) -> El {
     let label = tab_label(order, path);
     let (switch, close) = (path.to_string(), path.to_string());
     let marker = if dirty { "•" } else { "" };
-    let pill = row()
+    let mark = marks.get(path);
+    let status = mark.map(|(_, status)| *status);
+    let mut pill = row()
         .key(format!("doc-tab:{path}"))
         .h(24.0)
         .gap(5.0)
@@ -1016,14 +1127,28 @@ fn doc_tab(s: &State, ink: &Ink, order: &[String], path: &str) -> El {
         .hover(ink.text.alpha(0.06))
         .press(ink.text.alpha(0.10))
         .role("tab")
-        .label(if dirty {
-            format!("{label}, unsaved")
-        } else {
-            label.clone()
+        .label(match (status, dirty) {
+            (Some(status), true) => format!("{label}, {status}, unsaved"),
+            (Some(status), false) => format!("{label}, {status}"),
+            (None, true) => format!("{label}, unsaved"),
+            (None, false) => label.clone(),
         })
         .help(path.to_string())
         .focusable(true)
-        .focus_ring(2.0, 1.0, ink.accent)
+        .focus_ring(2.0, 1.0, ink.accent);
+    // The status dot leads, leaving the dirty `•` its own slot so the two
+    // signals never trade places.
+    if let Some((tone, _)) = mark {
+        pill = pill.child(
+            rune::el()
+                .key(format!("doc-tab-change:{path}"))
+                .size(6.0, 6.0)
+                .radius(3.0)
+                .fill(*tone)
+                .a11y_hidden(),
+        );
+    }
+    let pill = pill
         .child(
             theme::txt(marker, T12M, ink.warning)
                 .key(format!("doc-tab-dirty:{path}"))
@@ -1394,78 +1519,138 @@ fn editor_pane(s: &State, ink: &Ink, k: &Kit) -> El {
             );
         }
     }
-    // Desktop surface pick: rendered preview whenever the doc is markdown
-    // and preview is toggled — editable or read-only — else the editable
-    // code surface, else selectable read-only text.
+    // Desktop surface pick: a rendered preview whenever the doc is markdown
+    // and preview is toggled (editable or read-only), media outside the
+    // editor, otherwise the code surface. Every text tab's code surface stays
+    // mounted in every mode — only the active tab's surface is visible and
+    // interactive, and in preview/media mode the visible editor is the
+    // preview/media view in front of the hidden surfaces.
     let is_md = doc.kind == DocKind::Text && draft::is_markdown_path(&doc.path);
-    if let Some(media) = &doc.media {
-        pane.child(crate::editor::media::view(media, ink))
-    } else if is_md && doc.markdown_preview {
-        pane.child(markdown_surface(s, k).grow(1.0).min_h(0.0))
-    } else if doc.editable() {
-        pane.child(editor_surface(s, ink, k).grow(1.0).min_h(0.0))
-    } else {
-        pane.child(read_only_surface(s, ink, k).grow(1.0).min_h(0.0))
+    let code_mode = doc.media.is_none() && !(is_md && doc.markdown_preview);
+    let mut order = s.editor.tabs.order.clone();
+    if order.is_empty() {
+        order.push(doc.path.clone());
     }
+    // The inactive surfaces sit behind, absolutely placed so they take no flow
+    // space; the visible surface (or the preview/media view) stays in the
+    // normal flow, where the wheel and pointer reach it as they did before
+    // the stack. Keys are per document, so ordering never confuses a runtime
+    // lookup.
+    let mut stack = col().grow(1.0).min_w(0.0).min_h(0.0);
+    for path in &order {
+        if open_doc_at(s, path).is_none_or(|tab| tab.media.is_some())
+            || s.editor.doc_code(path).is_none()
+        {
+            continue;
+        }
+        let visible = code_mode && *path == doc.path;
+        let surface = tab_surface(s, ink, k, path, visible).key(format!("code-surface:{path}"));
+        let surface = if visible {
+            surface.grow(1.0).min_w(0.0).min_h(0.0)
+        } else {
+            surface
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .opacity(0.0)
+                .a11y_hidden()
+                .focusable(false)
+        };
+        stack = stack.child(surface);
+    }
+    if let Some(media) = &doc.media {
+        stack = stack.child(crate::editor::media::view(media, ink).grow(1.0).min_h(0.0));
+    } else if is_md && doc.markdown_preview {
+        stack = stack.child(markdown_surface(s, k).grow(1.0).min_h(0.0));
+    }
+    pane.child(stack)
 }
 
-/// Gutter + scroll-synced text input. `TextEdit` owns selection/undo/IME;
-/// the gutter re-derives line numbers from `edit.text` each frame.
-fn editor_surface(s: &State, ink: &Ink, k: &Kit) -> El {
-    crate::editor::code::Code::<State>::new(code_get, code_get_mut)
-        .register(|s: &mut State| &mut s.editor.vim_register)
-        // The tab chords get first refusal: `Tab` would indent and `⌘⌥→`
-        // would word-move before `AppSpec::on_key` ever saw them.
-        .preempt_key(crate::editor::keyboard::on_key)
-        .on_changed(code_changed)
-        .on_save(|st: &mut State, _tx: &mut Tx| {
-            save_active_doc(st);
-        })
-        .on_vim_command(|st: &mut State, cmd: VimCommand, tx: &mut Tx| match cmd {
-            VimCommand::Save => save_active_doc(st),
-            VimCommand::Close => {
-                if let Some(path) = st.editor.doc.as_ref().map(|d| d.path.clone()) {
-                    navigation::navigate(st, PendingNav::CloseTab { path }, tx);
-                }
-            }
-            VimCommand::SaveClose => {
-                let Some(path) = st.editor.doc.as_ref().map(|d| d.path.clone()) else {
-                    return;
-                };
-                let dirty = st.editor.doc.as_ref().is_some_and(|d| d.dirty());
-                if dirty {
-                    st.editor.save_resume = Some(navigation::Guard {
-                        pending: PendingNav::CloseTab { path: path.clone() },
-                        doc_path: path,
-                        queue: Vec::new(),
-                        quitting: false,
-                    });
-                }
+/// The open document at `path`: the active slot or a parked tab.
+fn open_doc_at<'a>(s: &'a State, path: &str) -> Option<&'a draft::OpenDoc> {
+    s.editor
+        .doc
+        .as_ref()
+        .filter(|d| d.path == path)
+        .or_else(|| s.editor.tabs.parked.get(path))
+}
+
+/// One tab's kept-alive code surface. An inactive surface builds no
+/// callbacks and no chrome, but keeps its field mounted so Rune reuses the
+/// text layout it computed when the document first opened.
+fn tab_surface(s: &State, ink: &Ink, k: &Kit, path: &str, active: bool) -> El {
+    let get_path = path.to_string();
+    let get_mut_path = path.to_string();
+    let code = crate::editor::code::Code::<State>::new(
+        move |st: &State| {
+            st.editor
+                .doc_code(&get_path)
+                .expect("a mounted tab keeps its code state")
+        },
+        move |st: &mut State| {
+            st.editor
+                .doc_code_mut(&get_mut_path)
+                .expect("a mounted tab keeps its code state")
+        },
+    )
+    .active(active);
+    let code = if active {
+        code.register(|s: &mut State| &mut s.editor.vim_register)
+            // The tab chords get first refusal: `Tab` would indent and `⌘⌥→`
+            // would word-move before `AppSpec::on_key` ever saw them.
+            .preempt_key(crate::editor::keyboard::on_key)
+            .on_changed(code_changed)
+            .on_save(|st: &mut State, _tx: &mut Tx| {
                 save_active_doc(st);
-            }
-            VimCommand::Line(_) => {}
-        })
-        .on_go_to(
-            |st: &mut State, req: crate::editor::code::GoToRequest, tx: &mut Tx| {
-                navigation::start_go_to(st, req, tx);
-            },
-        )
-        .on_indent(|st: &mut State, choice, _tx: &mut Tx| {
-            st.editor.set_indent_choice(choice);
-        })
-        .on_blame(|st: &mut State, enabled, _tx: &mut Tx| {
-            crate::editor::blame::set_enabled(&mut st.editor, enabled);
-        })
-        .on_blame_open(|st: &mut State, commit: &str, tx: &mut Tx| {
-            crate::editor::blame::open_commit(st, commit, tx);
-        })
-        .on_send(|st: &mut State, tx: &mut Tx| {
-            crate::editor::snapshot::send(st, tx);
-        })
-        .on_secondary(|st: &mut State, p: rune::PointerPress, _tx: &mut Tx| {
-            st.editor.files.code_menu = Some((p.x, p.y));
-        })
-        .build(s, ink, k)
+            })
+            .on_vim_command(|st: &mut State, cmd: VimCommand, tx: &mut Tx| match cmd {
+                VimCommand::Save => save_active_doc(st),
+                VimCommand::Close => {
+                    if let Some(path) = st.editor.doc.as_ref().map(|d| d.path.clone()) {
+                        navigation::navigate(st, PendingNav::CloseTab { path }, tx);
+                    }
+                }
+                VimCommand::SaveClose => {
+                    let Some(path) = st.editor.doc.as_ref().map(|d| d.path.clone()) else {
+                        return;
+                    };
+                    let dirty = st.editor.doc.as_ref().is_some_and(|d| d.dirty());
+                    if dirty {
+                        st.editor.save_resume = Some(navigation::Guard {
+                            pending: PendingNav::CloseTab { path: path.clone() },
+                            doc_path: path,
+                            queue: Vec::new(),
+                            quitting: false,
+                        });
+                    }
+                    save_active_doc(st);
+                }
+                VimCommand::Line(_) => {}
+            })
+            .on_go_to(
+                |st: &mut State, req: crate::editor::code::GoToRequest, tx: &mut Tx| {
+                    navigation::start_go_to(st, req, tx);
+                },
+            )
+            .on_indent(|st: &mut State, choice, _tx: &mut Tx| {
+                st.editor.set_indent_choice(choice);
+            })
+            .on_blame(|st: &mut State, enabled, _tx: &mut Tx| {
+                crate::editor::blame::set_enabled(&mut st.editor, enabled);
+            })
+            .on_blame_open(|st: &mut State, commit: &str, tx: &mut Tx| {
+                crate::editor::blame::open_commit(st, commit, tx);
+            })
+            .on_send(|st: &mut State, tx: &mut Tx| {
+                crate::editor::snapshot::send(st, tx);
+            })
+            .on_secondary(|st: &mut State, p: rune::PointerPress, _tx: &mut Tx| {
+                st.editor.files.code_menu = Some((p.x, p.y));
+            })
+    } else {
+        code
+    };
+    code.build(s, ink, k)
 }
 
 fn close_code_menu(st: &mut State) {
@@ -1602,34 +1787,6 @@ fn markdown_surface(s: &State, k: &Kit) -> El {
         .w_full()
         .h_full()
         .fill(s.ink.bg)
-        .scroll_bar(k)
-}
-
-/// Non-editable kinds show the text read-only (scrollable/selectable).
-fn read_only_surface(s: &State, ink: &Ink, k: &Kit) -> El {
-    let text = s
-        .editor
-        .doc
-        .as_ref()
-        .map(|d| d.code.edit.text.clone())
-        .unwrap_or_default();
-    col()
-        .grow(1.0)
-        .min_h(0.0)
-        .w_full()
-        .h_full()
-        .fill(ink.bg)
-        .scroll(rune::ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(
-            rune::text(text)
-                .font(theme::T12.lh(18.0))
-                .color(ink.text)
-                .selectable(true)
-                .px(12.0)
-                .py(8.0),
-        )
         .scroll_bar(k)
 }
 
@@ -1840,6 +1997,74 @@ mod tests {
         assert!(s.editor.files.model.get(".env").is_some());
     }
 
+    /// Changed names take their status tone in the tree; an ignored row stays
+    /// dimmed even when a change entry names it, and folders stay plain.
+    #[test]
+    fn files_tree_tints_changed_names_and_keeps_ignored_dimmed() {
+        fn tone(rt: &Runtime<State>, text: &str) -> rune::Color {
+            rt.elements()
+                .into_iter()
+                .find(|e| e.text.as_deref() == Some(text))
+                .unwrap_or_else(|| panic!("{text} drawn"))
+                .text_color
+                .unwrap_or_else(|| panic!("{text} has a colour"))
+        }
+
+        let mut s = scene();
+        s.editor.files.paths = [
+            "README.md",
+            "a.rs",
+            "gone.txt",
+            "new.txt",
+            "guide.md",
+            "docs/keep.md",
+            "src/keep.rs",
+            "src/inner.rs",
+        ]
+        .iter()
+        .map(|p| p.to_string())
+        .collect();
+        s.editor.files.ignored = vec![".env".into()];
+        s.editor.rebuild_file_model();
+        s.editor.changes.checkout = s.editor.checkout_key.clone();
+        s.editor.changes.data = Some(app_core::git_view::GitViewChanges {
+            branch: None,
+            head: "abc".into(),
+            conflicts: vec![change("README.md", "both-modified")],
+            staged: vec![],
+            unstaged: vec![
+                change("a.rs", "modified"),
+                change("gone.txt", "deleted"),
+                change("src/inner.rs", "modified"),
+            ],
+            // The ignored file is named by stale change data on purpose:
+            // ignored styling must still win.
+            untracked: vec![change("new.txt", "untracked"), change(".env", "untracked")],
+            ahead: None,
+            operation: None,
+            merge_message: None,
+        });
+        let ink = s.ink;
+        let mut rt = Runtime::new(s, files_only, (1400.0, 900.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+        assert_eq!(tone(&rt, "a.rs"), ink.warning);
+        assert_eq!(tone(&rt, "new.txt"), ink.success);
+        assert_eq!(tone(&rt, "gone.txt"), ink.danger);
+        assert_eq!(tone(&rt, "README.md"), ink.danger);
+        assert_eq!(tone(&rt, ".env"), ink.muted, "ignored styling wins");
+        assert_eq!(
+            tone(&rt, "src"),
+            ink.warning,
+            "a collapsed folder shows the change beneath it"
+        );
+        let plain = [ink.warning, ink.success, ink.danger, ink.accent];
+        assert!(!plain.contains(&tone(&rt, "guide.md")), "an unchanged file");
+        assert!(
+            !plain.contains(&tone(&rt, "docs")),
+            "a folder with no changed file beneath it"
+        );
+    }
+
     #[test]
     fn filter_input_types_and_filters_tree() {
         let mut rt = Runtime::new(scene(), files_only, (900.0, 700.0), Env::new(true, 2.0));
@@ -1915,15 +2140,21 @@ mod tests {
             for _ in 0..20 {
                 rt.frame(1.0 / 60.0);
             }
+            let path = rt.state.editor.doc.as_ref().unwrap().path.clone();
             let viewport = rt
                 .elements()
                 .into_iter()
-                .find(|e| e.key.as_deref() == Some(crate::editor::code::SCROLL_KEY))
+                .find(|e| {
+                    e.key.as_deref() == Some(crate::editor::code::doc_scroll_key(&path).as_str())
+                })
                 .unwrap();
             let field = rt
                 .elements()
                 .into_iter()
-                .find(|e| e.key.as_deref() == Some(crate::editor::code::FIELD_KEY))
+                .find(|e| {
+                    e.key.as_deref() == Some(crate::editor::code::doc_field_key(&path).as_str())
+                        && e.opacity > 0.9
+                })
                 .unwrap();
             assert!(rt.state.editor.doc.as_ref().unwrap().editable());
             assert!(!rt.state.editor.doc.as_ref().unwrap().code.read_only);
@@ -2308,6 +2539,17 @@ mod tests {
             ahead: None,
             operation: None,
             merge_message: None,
+        }
+    }
+
+    /// A changed-file entry with an explicit status.
+    fn change(path: &str, status: &'static str) -> app_core::git_view::StatusEntry {
+        app_core::git_view::StatusEntry {
+            path: path.into(),
+            orig_path: None,
+            status,
+            added: None,
+            removed: None,
         }
     }
 
@@ -2720,6 +2962,79 @@ mod tests {
         assert!(changed_layer(&s, "src/a.rs").is_none());
         s.editor.changes.checkout = None;
         assert!(changed_layer(&s, "src/a.rs").is_none());
+    }
+
+    /// Marks describe the working tree: a conflict beats an unstaged edit,
+    /// an unstaged edit beats a staged view, and only this checkout's fresh
+    /// data counts.
+    #[test]
+    fn change_marks_priority_freshness_and_renames() {
+        let mut s = scene();
+        s.editor.changes.checkout = s.editor.checkout_key.clone();
+        let mut renamed = change("src/old.rs", "renamed");
+        renamed.path = "src/new.rs".into();
+        renamed.orig_path = Some("src/old.rs".into());
+        s.editor.changes.data = Some(app_core::git_view::GitViewChanges {
+            branch: None,
+            head: "abc".into(),
+            conflicts: vec![
+                change("both.txt", "both-modified"),
+                change("src/conflict.rs", "both-added"),
+            ],
+            staged: vec![
+                change("both.txt", "both-modified"),
+                change("src/a.rs", "added"),
+                renamed,
+            ],
+            unstaged: vec![
+                change("src/a.rs", "modified"),
+                change("gone.txt", "deleted"),
+            ],
+            untracked: vec![
+                change("new.txt", "untracked"),
+                change("new/x.txt", "untracked"),
+            ],
+            ahead: None,
+            operation: None,
+            merge_message: None,
+        });
+        let ink = s.ink;
+        let marks = change_marks(&s, &ink);
+        assert_eq!(
+            marks.files.get("both.txt"),
+            Some(&(ink.danger, "Both modified"))
+        );
+        assert_eq!(
+            marks.files.get("src/a.rs"),
+            Some(&(ink.warning, "Modified"))
+        );
+        assert_eq!(
+            marks.files.get("new.txt"),
+            Some(&(ink.success, "Untracked"))
+        );
+        assert_eq!(marks.files.get("gone.txt"), Some(&(ink.danger, "Deleted")));
+        assert_eq!(
+            marks.files.get("src/new.rs"),
+            Some(&(ink.accent, "Renamed"))
+        );
+        assert_eq!(
+            marks.files.get("src/old.rs"),
+            None,
+            "a rename marks its new path"
+        );
+        assert_eq!(marks.files.len(), 7);
+        // A folder carries its most significant change: a conflict beats an
+        // edit, and an untracked-only folder is success.
+        assert_eq!(marks.dirs.get("src"), Some(&ink.danger));
+        assert_eq!(marks.dirs.get("new"), Some(&ink.success));
+        assert_eq!(marks.dirs.len(), 2, "only changed folders are marked");
+
+        // Another checkout's data, and missing data, mark nothing.
+        s.editor.changes.checkout = Some("deadbeef".into());
+        assert!(change_marks(&s, &ink).files.is_empty());
+        s.editor.changes.checkout = s.editor.checkout_key.clone();
+        s.editor.changes.data = None;
+        assert!(change_marks(&s, &ink).files.is_empty());
     }
 
     /// Reload arms `doc_reload` only on an accepted enqueue and never
@@ -4012,6 +4327,369 @@ mod tests {
         );
     }
 
+    /// Every open tab keeps a code surface mounted; only the active one is
+    /// visible, focusable and carries chrome, so a switch reuses its layout.
+    #[test]
+    fn open_tabs_keep_a_surface_each_and_only_the_active_one_is_live() {
+        let mut s = scene();
+        open_tab_doc(&mut s, "src/a.rs", "a\n");
+        open_tab_doc(&mut s, "src/b.rs", "b\n"); // active
+        s.editor.doc.as_mut().unwrap().code.find.open = true;
+        s.editor
+            .tabs
+            .parked
+            .get_mut("src/a.rs")
+            .unwrap()
+            .code
+            .find
+            .open = true;
+        let rt = kb_runtime(s);
+
+        let surfaces: Vec<_> = rt
+            .elements()
+            .into_iter()
+            .filter(|e| {
+                e.key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("code-surface:"))
+            })
+            .collect();
+        assert_eq!(surfaces.len(), 2, "one surface per open tab");
+        let visible: Vec<_> = surfaces.iter().filter(|e| e.opacity > 0.9).collect();
+        assert_eq!(visible.len(), 1, "one surface is shown");
+        assert_eq!(
+            visible[0].key.as_deref(),
+            Some("code-surface:src/b.rs"),
+            "the active tab's surface"
+        );
+
+        let fields: Vec<_> = rt
+            .elements()
+            .into_iter()
+            .filter(|e| {
+                e.key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with(crate::editor::code::FIELD_KEY))
+            })
+            .collect();
+        assert_eq!(fields.len(), 2, "both fields stay mounted");
+        assert_eq!(
+            fields.iter().filter(|e| e.opacity > 0.9).count(),
+            1,
+            "only the active field is visible"
+        );
+        assert!(
+            fields.iter().any(|e| e.opacity < 0.1 && !e.focusable),
+            "the inactive field is not focusable"
+        );
+        let labels: Vec<String> = rt.elements().into_iter().filter_map(|e| e.label).collect();
+        assert_eq!(
+            labels.iter().filter(|l| l.as_str() == "Prev").count(),
+            1,
+            "only the active surface mounts its find bar"
+        );
+        assert_eq!(
+            labels.iter().filter(|l| l.as_str() == "Blame").count(),
+            1,
+            "only the active surface mounts its footer"
+        );
+    }
+
+    /// Activating a tab hands the code field's focus to that document, so
+    /// typing immediately edits the newly active file and never the parked
+    /// one; the parked buffer keeps its caret.
+    #[test]
+    fn switching_tabs_moves_focus_and_typing_hits_only_the_new_document() {
+        let mut s = scene();
+        open_tab_doc(&mut s, "src/a.rs", "aaa\n");
+        open_tab_doc(&mut s, "src/b.rs", "bbb\n"); // active
+        s.editor.doc.as_mut().unwrap().code.edit.focused = true;
+        s.editor.doc.as_mut().unwrap().code.edit.set_caret(2);
+        let mut rt = kb_runtime(s);
+        // A keyboard switch (the tab chord) carries the field focus; a tab
+        // click focuses the tab itself, as it does today.
+        rt.key(KeyEvent {
+            key: Key::PageUp,
+            mods: Mods {
+                ctrl: true,
+                cmd: true,
+                ..Mods::default()
+            },
+        });
+        rt.frame(0.0);
+        assert_eq!(rt.state.editor.doc.as_ref().unwrap().path, "src/a.rs");
+        assert!(
+            rt.state.editor.doc.as_ref().unwrap().code.edit.focused,
+            "focus follows the activated tab"
+        );
+        assert!(
+            !rt.state
+                .editor
+                .tabs
+                .parked
+                .get("src/b.rs")
+                .unwrap()
+                .code
+                .edit
+                .focused,
+            "the parked field is unfocused"
+        );
+        let parked_caret = rt
+            .state
+            .editor
+            .tabs
+            .parked
+            .get("src/b.rs")
+            .unwrap()
+            .code
+            .edit
+            .focus;
+        type_text(&mut rt, "x");
+        assert!(
+            rt.state
+                .editor
+                .doc
+                .as_ref()
+                .unwrap()
+                .code
+                .edit
+                .text
+                .contains('x'),
+            "typing edits the active document"
+        );
+        assert_eq!(
+            rt.state
+                .editor
+                .tabs
+                .parked
+                .get("src/b.rs")
+                .unwrap()
+                .code
+                .edit
+                .text,
+            "bbb\n",
+            "the parked buffer is untouched"
+        );
+        assert_eq!(
+            rt.state
+                .editor
+                .tabs
+                .parked
+                .get("src/b.rs")
+                .unwrap()
+                .code
+                .edit
+                .focus,
+            parked_caret,
+            "the parked caret stays"
+        );
+    }
+
+    /// Closing a tab unmounts only its surface; the neighbour that activates
+    /// keeps its own mounted editor.
+    #[test]
+    fn closing_a_tab_unmounts_its_surface() {
+        let mut s = scene();
+        open_tab_doc(&mut s, "src/a.rs", "a\n");
+        open_tab_doc(&mut s, "src/b.rs", "b\n");
+        open_tab_doc(&mut s, "src/c.rs", "c\n"); // active
+        let mut rt = kb_runtime(s);
+        let surfaces = |rt: &Runtime<State>| -> Vec<String> {
+            rt.elements()
+                .into_iter()
+                .filter(|e| !e.exiting)
+                .filter_map(|e| e.key)
+                .filter(|k| k.starts_with("code-surface:"))
+                .collect()
+        };
+        assert_eq!(surfaces(&rt).len(), 3, "one surface per open tab");
+
+        // Close the parked a.rs through its × button.
+        let close = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.label.as_deref() == Some("Close a.rs"))
+            .expect("a.rs close button");
+        click(&mut rt, close.rect[0] + 8.0, close.rect[1] + 8.0);
+        let left = surfaces(&rt);
+        assert_eq!(left.len(), 2, "the closed tab's surface is gone");
+        assert!(!left.contains(&"code-surface:src/a.rs".to_string()));
+
+        // Close the active c.rs: b activates and its surface takes over.
+        rt.update(|s, _tx| {
+            s.editor.close_tab("src/c.rs");
+        });
+        rt.frame(0.0);
+        assert_eq!(
+            rt.state.editor.tabs.order,
+            vec!["src/b.rs".to_string()],
+            "only b stays open"
+        );
+        assert_eq!(rt.state.editor.doc.as_ref().unwrap().path, "src/b.rs");
+        let left = surfaces(&rt);
+        assert_eq!(left, vec!["code-surface:src/b.rs".to_string()]);
+    }
+
+    /// The wheel over the editor scrolls the active surface even while other
+    /// tabs' surfaces are mounted below it.
+    #[test]
+    fn the_wheel_scrolls_the_active_surface_with_other_tabs_mounted() {
+        let mut s = scene();
+        open_tab_doc(&mut s, "src/a.rs", &"line\n".repeat(400));
+        open_tab_doc(&mut s, "src/b.rs", &"line\n".repeat(400)); // active
+        let mut rt = kb_runtime(s);
+        let field = rt
+            .elements()
+            .into_iter()
+            .find(|e| {
+                e.key.as_deref() == Some(crate::editor::code::doc_field_key("src/b.rs").as_str())
+                    && e.opacity > 0.9
+            })
+            .expect("the active code field mounts");
+        let (x, y) = (field.rect[0] + field.rect[2] / 2.0, field.rect[1] + 100.0);
+        let before = rt.state.editor.doc.as_ref().unwrap().code.scroll_offset()[1];
+        rt.wheel_event(rune::WheelEvent::new(0.0, -160.0).at(x, y));
+        for _ in 0..12 {
+            rt.frame(1.0 / 60.0);
+        }
+        let after = rt.state.editor.doc.as_ref().unwrap().code.scroll_offset()[1];
+        assert!(
+            after > before,
+            "the wheel scrolls the active surface: {before} -> {after}"
+        );
+        assert_eq!(
+            rt.state
+                .editor
+                .tabs
+                .parked
+                .get("src/a.rs")
+                .unwrap()
+                .code
+                .scroll_offset(),
+            [0.0, 0.0],
+            "the inactive surface does not scroll"
+        );
+    }
+
+    /// With a markdown preview showing, every text tab's code surface stays
+    /// mounted behind it, so switching back to a code tab reuses its layout.
+    #[test]
+    fn a_markdown_preview_keeps_every_tab_surface_mounted() {
+        let mut s = scene();
+        open_tab_doc(&mut s, "src/a.rs", "a\n");
+        open_tab_doc(&mut s, "README.md", "# md\n"); // active
+        s.editor.doc.as_mut().unwrap().markdown_preview = true;
+        let rt = kb_runtime(s);
+        let surfaces: Vec<_> = rt
+            .elements()
+            .into_iter()
+            .filter(|e| !e.exiting)
+            .filter(|e| {
+                e.key
+                    .as_deref()
+                    .is_some_and(|k| k.starts_with("code-surface:"))
+            })
+            .collect();
+        assert_eq!(surfaces.len(), 2, "both tabs keep a surface mounted");
+        assert!(
+            surfaces.iter().all(|e| e.opacity < 0.1),
+            "the preview is what shows, not a code surface"
+        );
+    }
+
+    /// A tab with a Git change shows its status dot, names the status in its
+    /// accessible label and keeps the dirty marker; stale data marks nothing.
+    #[test]
+    fn tabs_show_status_dots_and_name_the_status() {
+        fn dot(rt: &Runtime<State>, path: &str) -> Option<rune::Color> {
+            let key = format!("doc-tab-change:{path}");
+            rt.elements()
+                .into_iter()
+                .find(|e| e.key.as_deref() == Some(key.as_str()))
+                .map(|e| e.fill)
+        }
+
+        let mut s = scene();
+        for (path, text) in [
+            ("src/a.rs", "a\n"),
+            ("src/b.rs", "b\n"),
+            ("src/c.rs", "c\n"),
+            ("src/d.rs", "d\n"),
+            ("src/e.rs", "e\n"),
+        ] {
+            open_tab_doc(&mut s, path, text);
+        }
+        s.editor
+            .tabs
+            .parked
+            .get_mut("src/d.rs")
+            .unwrap()
+            .code
+            .edit
+            .insert("x");
+        s.editor.changes.checkout = s.editor.checkout_key.clone();
+        s.editor.changes.data = Some(app_core::git_view::GitViewChanges {
+            branch: None,
+            head: "abc".into(),
+            conflicts: vec![change("src/c.rs", "both-modified")],
+            staged: vec![],
+            unstaged: vec![
+                change("src/a.rs", "modified"),
+                change("src/d.rs", "modified"),
+                change("src/e.rs", "deleted"),
+            ],
+            untracked: vec![],
+            ahead: None,
+            operation: None,
+            merge_message: None,
+        });
+        let ink = s.ink;
+        let rt = kb_runtime(s);
+        assert_eq!(dot(&rt, "src/a.rs"), Some(ink.warning));
+        assert_eq!(dot(&rt, "src/b.rs"), None, "a clean file has no dot");
+        assert_eq!(dot(&rt, "src/c.rs"), Some(ink.danger));
+        assert_eq!(dot(&rt, "src/d.rs"), Some(ink.warning));
+        assert_eq!(dot(&rt, "src/e.rs"), Some(ink.danger), "deleted, open tab");
+        let labels: Vec<String> = doc_tabs(&rt).into_iter().filter_map(|e| e.label).collect();
+        for want in [
+            "a.rs, Modified",
+            "b.rs",
+            "c.rs, Both modified",
+            "d.rs, Modified, unsaved",
+            "e.rs, Deleted",
+        ] {
+            assert!(
+                labels.iter().any(|l| l == want),
+                "missing {want}: {labels:?}"
+            );
+        }
+        let dirty = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some("doc-tab-dirty:src/d.rs"))
+            .expect("the unsaved marker stays");
+        assert_eq!(dirty.text.as_deref(), Some("•"));
+
+        // Data for another checkout paints no dot and keeps today's labels.
+        let mut s = scene();
+        open_tab_doc(&mut s, "src/a.rs", "a\n");
+        s.editor.changes.checkout = Some("deadbeef".into());
+        s.editor.changes.data = Some(app_core::git_view::GitViewChanges {
+            branch: None,
+            head: "abc".into(),
+            conflicts: vec![],
+            staged: vec![],
+            unstaged: vec![change("src/a.rs", "modified")],
+            untracked: vec![],
+            ahead: None,
+            operation: None,
+            merge_message: None,
+        });
+        let rt = kb_runtime(s);
+        assert_eq!(dot(&rt, "src/a.rs"), None);
+        assert_eq!(doc_tabs(&rt)[0].label.as_deref(), Some("a.rs"));
+    }
+
     /// Clicking a tab activates it through `SwitchTab`; the × closes its
     /// tab through `CloseTab` without touching the active document.
     #[test]
@@ -4062,10 +4740,14 @@ mod tests {
         open_tab_doc(&mut s, "src/b.rs", "b\n");
         open_tab_doc(&mut s, "src/c.rs", "c text here\n"); // active
         let mut rt = kb_runtime(s);
+        let active_path = rt.state.editor.doc.as_ref().unwrap().path.clone();
         let field = rt
             .elements()
             .into_iter()
-            .find(|e| e.key.as_deref() == Some(crate::editor::code::FIELD_KEY))
+            .find(|e| {
+                e.key.as_deref() == Some(crate::editor::code::doc_field_key(&active_path).as_str())
+                    && e.opacity > 0.9
+            })
             .expect("the code field mounts");
         click(&mut rt, field.rect[0] + 30.0, field.rect[1] + 8.0);
         let caret = rt.state.editor.doc.as_ref().unwrap().code.edit.range();

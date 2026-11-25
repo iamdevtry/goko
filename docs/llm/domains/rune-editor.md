@@ -148,6 +148,42 @@ Known gap: a commit, stage or discard made from the Changes section does not re-
 
 Evidence: `apps/rune/src/editor/line_changes.rs`, `apps/rune/src/editor/code.rs`, `apps/rune/src/editor/backend.rs`, `apps/rune/src/editor/backend/apply.rs`, `crates/app-core/src/git_view.rs`
 
+### RNE-change-marks
+
+The system SHALL mark the current checkout's changed files in the Files section from the freshest Changes data it already holds — tinting a changed file's name and every folder that holds one in the file tree, and showing a status dot on each open-file tab, conflicts included — using the shared status tones (modified and typechanged warning, added and untracked success, deleted and conflicted danger, renamed and copied accent), preferring an unstaged status over a staged one and a conflict over both for a file, and the most significant status beneath it for a folder (conflict, then deleted, modified or typechanged, added or untracked, renamed or copied), keeping Git-ignored rows dimmed, naming the status in each tab's accessible label, and issuing no Git read of its own.
+
+#### Scenario: Changing files stand out in the tree
+
+- GIVEN the checkout's Changes data lists `src/a.rs` as modified and `new.txt` as untracked
+- WHEN the Files section renders the file tree
+- THEN `a.rs` is drawn in the warning tone, `new.txt` in the success tone, and unchanged files keep the normal label colour
+
+#### Scenario: A folder shows the change beneath it
+
+- GIVEN `src/a.rs` is modified and `src/both.txt` is conflicted, and `new/` holds only an untracked file
+- WHEN the tree renders with those folders collapsed
+- THEN the `src` row uses the danger tone, the `new` row uses the success tone, and a folder with no changed file beneath it keeps the normal label colour
+
+#### Scenario: Conflict and unstaged statuses win
+
+- GIVEN a path is both conflicted and listed as unstaged, and another path is staged as added and then edited again
+- WHEN the marks are derived
+- THEN the conflicted path uses the danger tone and names its conflict kind, and the re-edited path uses the warning tone of its unstaged status
+
+#### Scenario: No dot without fresh data
+
+- GIVEN an open tab whose path has no entry in the current checkout's Changes data, or the held data belongs to another checkout
+- WHEN the tab strip renders
+- THEN the tab shows no status dot and its accessible label is unchanged
+
+#### Scenario: Unsaved edits keep their marker
+
+- GIVEN a tab whose file is changed in Git and also has unsaved edits
+- WHEN the tab strip renders
+- THEN the tab shows the status dot in the status tone beside the existing unsaved marker, and its accessible label names the status and then "unsaved"
+
+Evidence: `apps/rune/src/editor/files.rs`, `apps/rune/src/editor/changes.rs`
+
 ### RNE-changes-auto-refresh
 
 The system SHALL, while the Editor view is active and the window is focused, re-read the Changes list every three seconds (less often after a slow read) while the Changes section shows and compare the open document with disk every three seconds while the Files section shows — each, and the file list, also at once when the window regains focus or the Editor view is entered — without a loading indicator and without a Changes read while a Git write is in flight, silently replacing a clean document whose disk text differs, keeping a dirty document with a notice row offering Overwrite and Reload from disk, and keeping a vanished document with a notice row.
@@ -1069,6 +1105,30 @@ The system SHALL offer an optional Vim mode for the code field, off by default a
 - THEN the key does not reach the engine, as documented in the Settings description, while Insert mode still composes Vietnamese normally
 
 Evidence: `apps/rune/src/editor/vim.rs`, `apps/rune/src/editor/code.rs`, `apps/rune/src/editor/state.rs`, `apps/rune/src/editor/find.rs`, `apps/rune/src/settings.rs`, `apps/rune/src/main.rs`, `apps/rune/src/editor/backend/apply.rs`
+
+### RNE-tab-switch-reuse
+
+The system SHALL show an open tab's editor immediately when that tab is activated — keeping one code surface mounted for every open tab while the tab is open, rendering only the active tab's surface visibly and interactively, moving focus to the document being activated, and reusing its laid-out text so activation lays out no document text again and issues no file read of its own.
+
+#### Scenario: Switching between two large open files
+
+- GIVEN two files of about 3 000 lines are open as tabs
+- WHEN the user switches between their tabs
+- THEN each file's text appears immediately with its own caret and scroll position, and no file read is issued for the activated tab
+
+#### Scenario: Only the active tab answers input
+
+- GIVEN two tabs are open and the first is active
+- WHEN the user types in the code field
+- THEN only the active document's buffer changes, the inactive document's buffer stays byte-for-byte unchanged, and the inactive surface is neither focusable nor pickable
+
+#### Scenario: Closing a tab drops its surface
+
+- GIVEN three tabs are open
+- WHEN the user closes one
+- THEN that tab's surface is gone and switching between the remaining tabs is still immediate
+
+Evidence: `apps/rune/src/editor/files.rs`, `apps/rune/src/editor/code.rs`, `apps/rune/src/editor/state.rs`
 
 ## Flow
 
