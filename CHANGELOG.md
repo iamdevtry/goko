@@ -96,7 +96,6 @@ same entry. Keep each link on one line: What's new shows it as its text. The
   now types the path of a saved PNG, which Claude Code, Codex and OpenCode
   attach as an image. Files copied in Finder paste as their paths instead of
   their names. By [@asta-nguyen](https://github.com/asta-nguyen) in `49c6056`.
-=======
 
 ## [0.3.0] - 2026-11-18
 

@@ -389,6 +389,12 @@ pub fn apply(s: &mut State, pending: PendingNav, tx: &mut Tx) {
         }
         PendingNav::SetView(view) => {
             s.view = view;
+            // Settings shows the stored sides; re-read them here so a change
+            // made in another window applies without a restart.
+            if view == View::Settings {
+                s.refresh_list_aside_side();
+                s.refresh_sidebar_side();
+            }
             // Go-to-definition belongs to the Editor view's Files surface:
             // leaving the view cancels the lookup so a late reply cannot
             // pull the user back into the editor.

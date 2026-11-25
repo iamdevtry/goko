@@ -42,9 +42,6 @@ pub const LIST_ASIDE_SIDE_KEY: &str = "goko.editor.list_side";
 pub fn files_view(s: &State, ink: &Ink, k: &Kit) -> El {
     let marks = Rc::new(change_marks(s, ink));
     let mut root = col().grow(1.0).min_w(0.0).h_full().min_h(0.0);
-    if let Some(dialog) = trash_dialog(s, ink) {
-        root = root.child(dialog);
-    }
     if s.editor.files.truncated {
         root = root.child(theme::txt(
             "File list limited to 20,000 entries.",
@@ -104,6 +101,12 @@ pub fn files_view(s: &State, ink: &Ink, k: &Kit) -> El {
         split.child(aside).child(detail)
     };
     root = root.child(split);
+    // The confirmation modals mount last: their members are themselves plus
+    // everything after them in tree order, so an earlier mount would let the
+    // split paint (and take presses) over the dialog.
+    if let Some(dialog) = trash_dialog(s, ink) {
+        root = root.child(dialog);
+    }
     // The confirmation is a modal: its members are itself plus everything
     // after it in tree order, so it must mount last — mounted earlier the
     // whole section would stay live and steal the dialog's presses.
@@ -1622,6 +1625,9 @@ fn editor_pane(s: &State, ink: &Ink, k: &Kit) -> El {
     // the stack. Keys are per document, so ordering never confuses a runtime
     // lookup.
     let mut stack = col().grow(1.0).min_w(0.0).min_h(0.0);
+    // The visible surface mounts LAST so it stays on top: the hidden ones keep
+    // full bounds (absolute, opacity 0) and would otherwise take the wheel.
+    let mut active_surface: Option<El> = None;
     for path in &order {
         if open_doc_at(s, path).is_none_or(|tab| tab.media.is_some())
             || s.editor.doc_code(path).is_none()
@@ -1630,18 +1636,22 @@ fn editor_pane(s: &State, ink: &Ink, k: &Kit) -> El {
         }
         let visible = code_mode && *path == doc.path;
         let surface = tab_surface(s, ink, k, path, visible).key(format!("code-surface:{path}"));
-        let surface = if visible {
-            surface.grow(1.0).min_w(0.0).min_h(0.0)
+        if visible {
+            active_surface = Some(surface.grow(1.0).min_w(0.0).min_h(0.0));
         } else {
-            surface
-                .absolute(0.0, 0.0)
-                .w_full()
-                .h_full()
-                .opacity(0.0)
-                .a11y_hidden()
-                .focusable(false)
-        };
-        stack = stack.child(surface);
+            stack = stack.child(
+                surface
+                    .absolute(0.0, 0.0)
+                    .w_full()
+                    .h_full()
+                    .opacity(0.0)
+                    .a11y_hidden()
+                    .focusable(false),
+            );
+        }
+    }
+    if let Some(active) = active_surface {
+        stack = stack.child(active);
     }
     if let Some(media) = &doc.media {
         stack = stack.child(crate::editor::media::view(media, ink).grow(1.0).min_h(0.0));
@@ -4369,8 +4379,26 @@ mod tests {
         assert!(jobs.try_iter().next().is_none(), "already read: no new job");
     }
 
-    /// Move to Trash asks first; confirming sends the job, and an open draft
-    /// under the entry blocks it.
+    /// Move to Trash asks first; cancelling sends nothing.
+    #[test]
+    fn move_to_trash_cancel_sends_nothing() {
+        let (backend, jobs) = crate::editor::backend::channel_backend();
+        let mut s = scene();
+        s.editor.backend = backend;
+        s.editor.files.delete_prompt = Some("docs/guide.md".into());
+        let mut rt = kb_runtime(s);
+        let cancel = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.label.as_deref() == Some("Cancel"))
+            .expect("Cancel mounted");
+        click(&mut rt, cancel.rect[0] + 5.0, cancel.rect[1] + 5.0);
+        assert!(rt.state.editor.files.delete_prompt.is_none());
+        assert!(jobs.try_iter().next().is_none(), "cancel sends nothing");
+    }
+
+    /// Confirming moves the entry to the Trash, and an open draft under the
+    /// entry blocks it.
     #[test]
     fn move_to_trash_confirms_then_sends_and_a_draft_blocks_it() {
         let (backend, jobs) = crate::editor::backend::channel_backend();
@@ -4378,20 +4406,11 @@ mod tests {
         s.editor.backend = backend;
         s.editor.files.delete_prompt = Some("docs/guide.md".into());
         let mut rt = kb_runtime(s);
-        let button = |rt: &Runtime<State>, label: &str| {
-            rt.elements()
-                .into_iter()
-                .find(|e| e.label.as_deref() == Some(label))
-                .unwrap_or_else(|| panic!("{label} mounted"))
-        };
-        let cancel = button(&rt, "Cancel");
-        click(&mut rt, cancel.rect[0] + 5.0, cancel.rect[1] + 5.0);
-        assert!(rt.state.editor.files.delete_prompt.is_none());
-        assert!(jobs.try_iter().next().is_none(), "cancel sends nothing");
-
-        rt.state.editor.files.delete_prompt = Some("docs/guide.md".into());
-        rt.frame(1.0 / 60.0);
-        let confirm = button(&rt, "Move to Trash");
+        let confirm = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.label.as_deref() == Some("Move to Trash"))
+            .expect("Move to Trash mounted");
         click(&mut rt, confirm.rect[0] + 5.0, confirm.rect[1] + 5.0);
         assert!(rt.state.editor.files.delete_prompt.is_none());
         assert!(
@@ -5001,6 +5020,55 @@ mod tests {
             [0.0, 0.0],
             "the inactive surface does not scroll"
         );
+    }
+
+    /// The active surface must stay on top for the wheel: with the active tab
+    /// in the middle of the strip, the hidden surfaces mounted after it must
+    /// not take the wheel.
+    #[test]
+    fn the_wheel_scrolls_the_active_surface_when_it_is_not_the_last_tab() {
+        let mut s = scene();
+        open_tab_doc(&mut s, "src/a.rs", &"line\n".repeat(400));
+        open_tab_doc(&mut s, "src/b.rs", &"line\n".repeat(400));
+        open_tab_doc(&mut s, "src/c.rs", &"line\n".repeat(400)); // active
+        assert!(
+            s.editor.activate_tab("src/a.rs"),
+            "a becomes active mid-strip"
+        );
+        let mut rt = kb_runtime(s);
+        let field = rt
+            .elements()
+            .into_iter()
+            .find(|e| {
+                e.key.as_deref() == Some(crate::editor::code::doc_field_key("src/a.rs").as_str())
+                    && e.opacity > 0.9
+            })
+            .expect("the active code field mounts");
+        let (x, y) = (field.rect[0] + field.rect[2] / 2.0, field.rect[1] + 100.0);
+        let before = rt.state.editor.doc.as_ref().unwrap().code.scroll_offset()[1];
+        rt.wheel_event(rune::WheelEvent::new(0.0, -160.0).at(x, y));
+        for _ in 0..12 {
+            rt.frame(1.0 / 60.0);
+        }
+        let after = rt.state.editor.doc.as_ref().unwrap().code.scroll_offset()[1];
+        assert!(
+            after > before,
+            "the wheel scrolls the active surface: {before} -> {after}"
+        );
+        for parked in ["src/b.rs", "src/c.rs"] {
+            assert_eq!(
+                rt.state
+                    .editor
+                    .tabs
+                    .parked
+                    .get(parked)
+                    .unwrap()
+                    .code
+                    .scroll_offset(),
+                [0.0, 0.0],
+                "{parked} stays put"
+            );
+        }
     }
 
     /// With a markdown preview showing, every text tab's code surface stays

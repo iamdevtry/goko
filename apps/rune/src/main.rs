@@ -500,6 +500,38 @@ impl State {
         }
     }
 
+    /// Re-read the stored sidebar side when Settings opens or the window gains
+    /// focus: another window may have moved it, and this one only read it at
+    /// startup. A window where the user picked a side this session keeps it.
+    pub fn refresh_sidebar_side(&mut self) {
+        if self.sidebar_side_chosen {
+            return;
+        }
+        let _ = backend::enqueue(
+            &mut self.editor.backend,
+            backend::Job::project(backend::Req::GetSetting {
+                key: sidebar::SIDEBAR_SIDE_KEY.to_string(),
+            }),
+        );
+    }
+
+    /// Re-read the stored list side when Settings opens or the window gains
+    /// focus: a window that has been open a while only loaded the value at
+    /// startup, so a change made in another window would otherwise wait for a
+    /// restart. A window where the user picked a side this session keeps its
+    /// own choice.
+    pub fn refresh_list_aside_side(&mut self) {
+        if self.list_aside_side_chosen {
+            return;
+        }
+        let _ = backend::enqueue(
+            &mut self.editor.backend,
+            backend::Job::project(backend::Req::GetSetting {
+                key: editor::files::LIST_ASIDE_SIDE_KEY.to_string(),
+            }),
+        );
+    }
+
     /// Seconds until the notice toast closes; `None` with no toast. The poll
     /// asks for a wake at this time, so an idle app closes it on schedule.
     pub fn notice_remaining(&self, now: f64) -> Option<f64> {
@@ -1234,6 +1266,11 @@ impl State {
                 }
                 return;
             }
+            backend::Req::SetSetting { key, .. } if key == sidebar::SIDEBAR_SIDE_KEY => {
+                // The write is done: this window follows the stored side again
+                // (see `refresh_sidebar_side`), so another window's change reaches it.
+                self.sidebar_side_chosen = false;
+            }
             backend::Req::GetSetting { key } if key == editor::files::LIST_ASIDE_SIDE_KEY => {
                 if !self.list_aside_side_chosen
                     && let Ok(backend::ReplyData::Setting(Some(raw))) = &reply.result
@@ -1241,6 +1278,12 @@ impl State {
                     self.list_aside_side = sidebar::Side::parse(raw);
                 }
                 return;
+            }
+            backend::Req::SetSetting { key, .. } if key == editor::files::LIST_ASIDE_SIDE_KEY => {
+                // The write attempt is done, whatever its outcome: this window
+                // follows the stored side again (see `refresh_list_aside_side`),
+                // so a change made in another window still reaches it.
+                self.list_aside_side_chosen = false;
             }
             _ => {}
         }
@@ -1986,6 +2029,12 @@ fn on_ime(s: &mut State, ev: &rune::Ime, _tx: &mut Tx) -> bool {
 /// The window's focus flips: the done sound only plays while it is away.
 fn on_focus(s: &mut State, focused: bool, _tx: &mut Tx) {
     s.window_focused = focused;
+    // Another window may have changed the list position while this one was in
+    // the background; re-read it on focus so the tree follows without a restart.
+    if focused {
+        s.refresh_list_aside_side();
+        s.refresh_sidebar_side();
+    }
 }
 
 fn main() {

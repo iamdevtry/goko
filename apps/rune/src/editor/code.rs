@@ -932,7 +932,7 @@ impl<S: 'static> Code<S> {
         let Some(cmd) = &code.vim_cmd else {
             return col().w_full().h(0.0);
         };
-        let get_mut = self.get_mut;
+        let get_mut = Rc::clone(&self.get_mut);
         let on_command = self.on_vim_command.clone();
         let mut bar = row()
             .w_full()
@@ -951,27 +951,33 @@ impl<S: 'static> Code<S> {
                 .w(260.0)
                 .color(ink.text)
                 .caret(ink.text, ink.accent.alpha(0.3))
-                .on_edit(move |st: &mut S| -> &mut TextEdit {
-                    let code = get_mut(st);
-                    if code.vim_cmd.is_none() {
-                        code.vim_cmd = Some(VimCmd::new());
+                .on_edit({
+                    let get_mut = Rc::clone(&get_mut);
+                    move |st: &mut S| -> &mut TextEdit {
+                        let code = get_mut(st);
+                        if code.vim_cmd.is_none() {
+                            code.vim_cmd = Some(VimCmd::new());
+                        }
+                        &mut code.vim_cmd.as_mut().unwrap().input
                     }
-                    &mut code.vim_cmd.as_mut().unwrap().input
                 })
-                .on_input_key(move |st: &mut S, ev: &KeyEvent, tx: &mut Tx| -> bool {
-                    match &ev.key {
-                        Key::Escape => {
-                            get_mut(st).close_cmd_vim();
-                            true
-                        }
-                        Key::Enter => {
-                            let action = get_mut(st).submit_cmd_vim(tx);
-                            if let (Some(action), Some(cb)) = (action, &on_command) {
-                                cb(st, action, tx);
+                .on_input_key({
+                    let get_mut = Rc::clone(&get_mut);
+                    move |st: &mut S, ev: &KeyEvent, tx: &mut Tx| -> bool {
+                        match &ev.key {
+                            Key::Escape => {
+                                get_mut(st).close_cmd_vim();
+                                true
                             }
-                            true
+                            Key::Enter => {
+                                let action = get_mut(st).submit_cmd_vim(tx);
+                                if let (Some(action), Some(cb)) = (action, &on_command) {
+                                    cb(st, action, tx);
+                                }
+                                true
+                            }
+                            _ => false,
                         }
-                        _ => false,
                     }
                 }),
         );
@@ -1765,13 +1771,16 @@ fn paste_edit_at(
 fn request_clipboard_paste<S: 'static>(
     st: &mut S,
     tx: &mut Tx,
-    get_mut: fn(&mut S) -> &mut CodeState,
+    get_mut: &Rc<dyn Fn(&mut S) -> &mut CodeState>,
     on_changed: &Option<StateCallback<S>>,
     before: bool,
     count: usize,
 ) {
     let at = get_mut(st).edit.focus;
     let changed_cb = on_changed.clone();
+    // `read_clipboard` keeps the closure past this call, so the shared
+    // getter moves in as an owned clone instead of borrowing it.
+    let get_mut = Rc::clone(get_mut);
     tx.read_clipboard(move |st: &mut S, content, tx| {
         let text = content.text().to_string();
         if text.is_empty() {
@@ -1789,7 +1798,7 @@ fn request_clipboard_paste<S: 'static>(
             edit.insert(&insert);
         });
         code.edit.set_selection(caret, caret);
-        notify_changed(st, tx, get_mut, &changed_cb);
+        notify_changed(st, tx, &get_mut, &changed_cb);
     });
 }
 

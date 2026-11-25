@@ -3986,6 +3986,79 @@ fn the_stored_list_aside_side_restores_on_its_getsetting_reply() {
 }
 
 #[test]
+fn the_list_side_write_ack_lets_a_stored_side_apply_again() {
+    // Once this window's own write is acknowledged it follows the stored value
+    // again, so a change made in another window reaches it; a pick made here
+    // before the ack still wins.
+    let mut s = State::new(test_handle());
+    s.set_list_aside_side(crate::sidebar::Side::Right);
+    s.apply_reply(reply(
+        Req::SetSetting {
+            key: crate::editor::files::LIST_ASIDE_SIDE_KEY.to_string(),
+            value: "right".into(),
+        },
+        Ok(ReplyData::Ok),
+    ));
+    s.apply_reply(reply(
+        Req::GetSetting {
+            key: crate::editor::files::LIST_ASIDE_SIDE_KEY.to_string(),
+        },
+        Ok(ReplyData::Setting(Some("left".into()))),
+    ));
+    assert_eq!(s.list_aside_side, crate::sidebar::Side::Left);
+}
+
+#[test]
+fn a_window_that_picked_a_sidebar_side_keeps_it_when_settings_opens() {
+    let mut s = State::new(test_handle());
+    s.set_sidebar_side(crate::sidebar::Side::Right);
+    s.refresh_sidebar_side();
+    s.apply_reply(reply(
+        Req::GetSetting {
+            key: crate::sidebar::SIDEBAR_SIDE_KEY.to_string(),
+        },
+        Ok(ReplyData::Setting(Some("left".into()))),
+    ));
+    assert_eq!(s.sidebar_side, crate::sidebar::Side::Right);
+}
+
+#[test]
+fn the_sidebar_side_write_ack_lets_a_stored_side_apply_again() {
+    let mut s = State::new(test_handle());
+    s.set_sidebar_side(crate::sidebar::Side::Right);
+    s.apply_reply(reply(
+        Req::SetSetting {
+            key: crate::sidebar::SIDEBAR_SIDE_KEY.to_string(),
+            value: "right".into(),
+        },
+        Ok(ReplyData::Ok),
+    ));
+    s.apply_reply(reply(
+        Req::GetSetting {
+            key: crate::sidebar::SIDEBAR_SIDE_KEY.to_string(),
+        },
+        Ok(ReplyData::Setting(Some("left".into()))),
+    ));
+    assert_eq!(s.sidebar_side, crate::sidebar::Side::Left);
+}
+
+#[test]
+fn a_window_that_picked_a_list_side_keeps_it_when_settings_opens() {
+    // Opening Settings re-reads the stored side, but a window whose user picked
+    // one this session must not be flipped back to an older stored value.
+    let mut s = State::new(test_handle());
+    s.set_list_aside_side(crate::sidebar::Side::Right);
+    s.refresh_list_aside_side();
+    s.apply_reply(reply(
+        Req::GetSetting {
+            key: crate::editor::files::LIST_ASIDE_SIDE_KEY.to_string(),
+        },
+        Ok(ReplyData::Setting(Some("left".into()))),
+    ));
+    assert_eq!(s.list_aside_side, crate::sidebar::Side::Right);
+}
+
+#[test]
 fn the_stored_scroll_speed_restores_on_its_getsetting_reply() {
     let mut s = State::new(test_handle());
     assert_eq!(s.scroll_speed, 1.0);
