@@ -78,3 +78,4 @@
 - [Files change decorations: status colours in the tree and dots on tabs](changes/archive/2026-11-19-files-change-colors/design.md) ([tasks](changes/archive/2026-11-19-files-change-colors/tasks.md), [delta](changes/archive/2026-11-19-files-change-colors/delta.md))
 - [Folder change tint: a folder shows the most significant change beneath it](changes/archive/2026-11-19-folder-change-tint/delta.md)
 - [Mounted tab editors: switching tabs keeps each file's code surface alive](changes/archive/2026-11-19-mounted-tab-editors/design.md) ([tasks](changes/archive/2026-11-19-mounted-tab-editors/tasks.md), [delta](changes/archive/2026-11-19-mounted-tab-editors/delta.md))
+- [Files toolbar tabs: one header in the file-tree aside](changes/archive/files-toolbar-tabs/design.md) ([tasks](changes/archive/files-toolbar-tabs/tasks.md), [delta](changes/archive/files-toolbar-tabs/delta.md))

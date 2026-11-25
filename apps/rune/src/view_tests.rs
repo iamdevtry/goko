@@ -546,8 +546,8 @@ fn search_open_shows_results_in_aside_without_overflow() {
     );
     assert_no_horizontal_overflow(&rt, 760.0);
     // The editor surface keeps usable width in the remaining space:
-    // its `text_input` mounts below the toolbars (y > 150 at this
-    // viewport) and must be wider than a sliver.
+    // its `text_input` mounts below the Files aside header (y > 150 at
+    // this viewport) and must be wider than a sliver.
     let editor_fields: Vec<_> = els(&rt)
         .into_iter()
         .filter(|el| el.role == "textbox" && el.rect[1] > 150.0)

@@ -178,6 +178,11 @@ pub const T11ST: TextStyle = TextStyle::new(11.0, 600.0).tracking(0.55); // Proj
 pub const T12: TextStyle = TextStyle::new(12.0, 400.0);
 pub const T12TN: TextStyle = TextStyle::new(12.0, 400.0).features("'tnum' 1"); // text-xs tabular-nums
 pub const T12M: TextStyle = TextStyle::new(12.0, 500.0);
+/// Tab and segment labels on a 16 pt line box, so text sits on whole device pixels
+/// inside the 28–32 pt rows (as the sidebar's compact scale does). Every tab title
+/// and both segment labels are medium weight: the active one is told apart by
+/// colour, so selecting never changes a label's width and nudges its neighbours.
+pub const TAB: TextStyle = T12M.lh(16.0);
 pub const T128: TextStyle = TextStyle::new(12.8, 500.0); // button sm text-[0.8rem]
 pub const T14: TextStyle = TextStyle::new(14.0, 400.0);
 pub const T14M: TextStyle = TextStyle::new(14.0, 500.0);

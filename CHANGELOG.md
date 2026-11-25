@@ -32,6 +32,12 @@ same entry. Keep each link on one line: What's new shows it as its text. The
   status with the tab's name. The colours follow the Changes data Goko already
   refreshes.
 
+### Changed
+
+- The file filter and the code search now share one input under `Files | Text | Context`
+  tabs above the file tree, so the editor keeps its full height and width; the file
+  actions moved into the `File actions` menu.
+
 ## [0.4.0] - 2026-11-20
 
 ### Added
@@ -90,6 +96,7 @@ same entry. Keep each link on one line: What's new shows it as its text. The
   now types the path of a saved PNG, which Claude Code, Codex and OpenCode
   attach as an image. Files copied in Finder paste as their paths instead of
   their names. By [@asta-nguyen](https://github.com/asta-nguyen) in `49c6056`.
+=======
 
 ## [0.3.0] - 2026-11-18
 

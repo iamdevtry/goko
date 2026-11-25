@@ -180,12 +180,13 @@ crate. Build and launch it with `apps/rune/run-macos.sh` (see the [README](READM
   syncs, which run on a dedicated indexer thread outside that queue; replies carry a
   checkout key (`project_id` + canonical path) and a per-kind read generation, and stale
   results are dropped. Writes serialize on the same lane.
-- **Context search:** the Files toolbar always shows a search box, under the file filter,
-  with a `Text | Context` switch (the code names the modes `Content` and `Concept`; `Text`
-  is the literal `git grep` search and the default, and the pick lasts for the session).
-  `Context` ranks the checkout's text chunks from a derived SQLite FTS5 index in
-  `GOKO_HOME/search/`. The aside shows the results while a search is active and the file
-  tree when the file filter was edited last. A full
+- **Context search:** the Files aside's header shows a `Files | Text | Context` tab strip
+  with one input under it (the code names the search modes `Content` and `Concept`; `Text`
+  is the literal `git grep` search, and the pick lasts for the session). The `Files` tab
+  filters the file tree by name; `Text` and `Context` show the search pane. `Context` ranks
+  the checkout's text chunks from a derived SQLite FTS5 index in
+  `GOKO_HOME/search/`. The aside shows the search pane while a search tab is picked and
+  the file tree when the file filter was edited last. A full
   pass builds it on the indexer thread (one checkout at a time, first come first served)
   and a sync before each query re-evaluates only the paths `git status` names, so a file
   added or edited a moment ago is found by the next query. The query waits at most one
